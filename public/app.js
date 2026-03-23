@@ -3,6 +3,7 @@ let socket = io();
 let currentUser = null;
 let currentAuctionId = null;
 let isLoginMode = true;
+let currentTheme = 'light'; // Theme system variable
 
 // Form validation configuration
 const validationRules = {
@@ -69,6 +70,7 @@ const validationRules = {
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', function() {
+    initializeTheme(); // Initialize theme system
     loadAuctions();
     setupEventListeners();
     setupSocketListeners();
@@ -297,8 +299,8 @@ function showTab(tabName) {
     
     // Remove active state from all tab buttons
     document.querySelectorAll('[id$="Tab"]').forEach(btn => {
-        btn.classList.remove('bg-purple-600');
-        btn.classList.add('hover:bg-purple-500');
+        btn.classList.remove('btn-primary');
+        btn.classList.add('btn-secondary');
     });
     
     // Show selected tab
@@ -306,8 +308,8 @@ function showTab(tabName) {
     
     // Add active state to selected tab button
     const activeTab = document.getElementById(tabName + 'Tab');
-    activeTab.classList.add('bg-purple-600');
-    activeTab.classList.remove('hover:bg-purple-500');
+    activeTab.classList.add('btn-primary');
+    activeTab.classList.remove('btn-secondary');
     
     // Load tab-specific content
     if (tabName === 'auctions') {
@@ -377,7 +379,7 @@ function createAuctionCard(auction) {
                 ${auction.status}
             </span>
         </div>
-        <p class="text-gray-300 mb-4">${auction.description}</p>
+        <p class="text-secondary mb-4">${auction.description}</p>
         <div class="space-y-2 mb-4">
             <div class="flex justify-between">
                 <span>Starting Bid:</span>
@@ -404,11 +406,11 @@ function createAuctionCard(auction) {
         ` : ''}
         <div class="flex space-x-2">
             ${auction.status === 'active' && !isExpired && currentUser ? `
-                <button onclick="openBidModal('${auction.id}')" class="flex-1 bg-purple-600 hover:bg-purple-700 py-2 rounded-lg transition">
+                <button onclick="openBidModal('${auction.id}')" class="flex-1 py-2 rounded-lg transition btn-primary">
                     <i class="fas fa-gavel mr-2"></i>Place Bid
                 </button>
             ` : ''}
-            <button onclick="viewAuctionDetails('${auction.id}')" class="flex-1 bg-gray-600 hover:bg-gray-700 py-2 rounded-lg transition">
+            <button onclick="viewAuctionDetails('${auction.id}')" class="flex-1 py-2 rounded-lg transition btn-secondary">
                 <i class="fas fa-eye mr-2"></i>Details
             </button>
         </div>
@@ -664,8 +666,10 @@ function showFieldSuccess(fieldName) {
     clearFieldError(fieldName);
     
     // Add success styling to field
-    field.classList.add('border-green-500', 'bg-green-500', 'bg-opacity-20', 'focus:ring-green-400');
-    field.classList.remove('border-white', 'border-opacity-30', 'border-red-500', 'bg-red-500', 'bg-opacity-20', 'focus:ring-red-400');
+    field.classList.add('border-green-500', 'bg-green-500', 'bg-opacity-20');
+    field.style.boxShadow = '0 0 0 2px rgba(34, 197, 94, 0.5)';
+    field.classList.remove('border-red-500', 'bg-red-500', 'bg-opacity-20');
+    field.style.borderColor = 'var(--glass-border)';
     
     // Add aria-valid for accessibility
     field.setAttribute('aria-invalid', 'false');
@@ -679,8 +683,10 @@ function showFieldError(fieldName, message) {
     clearFieldError(fieldName);
     
     // Add error styling to field
-    field.classList.add('border-red-500', 'bg-red-500', 'bg-opacity-20', 'focus:ring-red-400');
-    field.classList.remove('border-white', 'border-opacity-30', 'border-green-500', 'bg-green-500', 'bg-opacity-20', 'focus:ring-green-400');
+    field.classList.add('border-red-500', 'bg-red-500', 'bg-opacity-20');
+    field.style.boxShadow = '0 0 0 2px rgba(239, 68, 68, 0.5)';
+    field.classList.remove('border-green-500', 'bg-green-500', 'bg-opacity-20');
+    field.style.borderColor = 'var(--glass-border)';
     
     // Add aria-invalid for accessibility
     field.setAttribute('aria-invalid', 'true');
@@ -703,8 +709,9 @@ function clearFieldError(fieldName) {
     const errorElement = document.getElementById(fieldName + 'Error');
     
     if (field) {
-        field.classList.remove('border-red-500', 'bg-red-500', 'bg-opacity-20', 'focus:ring-red-400', 'border-green-500', 'bg-green-500', 'bg-opacity-20', 'focus:ring-green-400');
-        field.classList.add('border-white', 'border-opacity-30');
+        field.classList.remove('border-red-500', 'bg-red-500', 'bg-opacity-20', 'border-green-500', 'bg-green-500', 'bg-opacity-20');
+        field.style.boxShadow = '';
+        field.style.borderColor = '';
         field.removeAttribute('aria-invalid');
     }
     
@@ -841,3 +848,59 @@ function showNotification(message, type = 'info') {
         notification.remove();
     }, 3000);
 }
+
+// Theme system functions
+function initializeTheme() {
+    // Check localStorage for saved theme preference
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme) {
+        currentTheme = savedTheme;
+    } else {
+        // Check system preference
+        currentTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    
+    applyTheme(currentTheme);
+}
+
+function toggleTheme() {
+    currentTheme = currentTheme === 'light' ? 'dark' : 'light';
+    applyTheme(currentTheme);
+    localStorage.setItem('theme', currentTheme);
+    
+    // Update theme icon
+    const themeIcon = document.getElementById('themeIcon');
+    if (themeIcon) {
+        themeIcon.className = currentTheme === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+    }
+    
+    showNotification(`Switched to ${currentTheme} mode`, 'info');
+}
+
+function applyTheme(theme) {
+    const root = document.documentElement;
+    const body = document.body;
+    
+    if (theme === 'dark') {
+        root.setAttribute('data-theme', 'dark');
+        body.classList.add('dark-theme');
+    } else {
+        root.removeAttribute('data-theme');
+        body.classList.remove('dark-theme');
+    }
+    
+    // Update theme icon
+    const themeIcon = document.getElementById('themeIcon');
+    if (themeIcon) {
+        themeIcon.className = theme === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+    }
+}
+
+// Listen for system theme changes
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+    // Only change if user hasn't manually set a preference
+    if (!localStorage.getItem('theme')) {
+        currentTheme = e.matches ? 'dark' : 'light';
+        applyTheme(currentTheme);
+    }
+});
