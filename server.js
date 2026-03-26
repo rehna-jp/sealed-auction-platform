@@ -8,6 +8,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { v4: uuidv4 } = require('uuid');
 const { Server, Keypair, TransactionBuilder, Networks, BASE_FEE, Asset } = require('stellar-sdk');
+const { RateLimiterMemory, RateLimiterRedis } = require('rate-limiter-flexible');
 // const { StellarSealedBidAuction } = require('./contracts/StellarSealedBidAuction');
 
 const app = express();
@@ -25,12 +26,83 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Rate limiting
-const limiter = rateLimit({
+// Advanced Rate Limiting with IP rotation protection
+const getFingerprintKey = (req) => {
+  // Use multiple identifiers to prevent IP rotation bypass
+  const fingerprint = [
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip,
+    req.headers['user-agent'],
+    req.headers['accept-language'],
+    req.headers['sec-ch-ua-platform'],
+    req.headers['sec-ch-ua-mobile']
+  ].join('|');
+  
+  // Create a hash of the fingerprint
+  return crypto.createHash('sha256').update(fingerprint).digest('hex');
+};
+
+// Multi-tiered rate limiting
+const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 100 requests per windowMs
+  keyGenerator: getFingerprintKey,
+  message: {
+    error: 'Too many requests',
+    message: 'Rate limit exceeded. Please try again later.',
+    retryAfter: Math.ceil(15 * 60)
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({
+      error: 'Too many requests',
+      message: 'Rate limit exceeded. Please try again later.',
+      retryAfter: Math.ceil(15 * 60)
+    });
+  }
 });
-app.use(limiter);
+
+// Stricter limits for sensitive endpoints
+const authLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10, // limit each IP to 10 login attempts per hour
+  keyGenerator: getFingerprintKey,
+  message: {
+    error: 'Too many login attempts',
+    message: 'Account locked due to too many failed login attempts. Please try again in 1 hour.',
+    retryAfter: Math.ceil(60 * 60)
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Very strict limits for bid placement
+const bidLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5, // limit each IP to 5 bids per minute
+  keyGenerator: getFingerprintKey,
+  message: {
+    error: 'Too many bids',
+    message: 'Bid rate limit exceeded. Please wait before placing more bids.',
+    retryAfter: 60
+  },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Apply general API rate limiting
+app.use('/api/', apiLimiter);
+
+// Apply stricter rate limiting to authentication endpoints
+app.use('/api/users/login', authLimiter);
+app.use('/api/users/register', rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5, // limit each IP to 5 registrations per hour
+  keyGenerator: getFingerprintKey
+}));
+
+// Apply bid-specific rate limiting
+app.use('/api/bids', bidLimiter);
 
 // In-memory storage (in production, use a proper database)
 const auctions = new Map();
