@@ -26,6 +26,30 @@ const io = socketIo(server, {
 // Security middleware
 app.use(helmet());
 
+// Security monitoring endpoint (admin only)
+app.get('/api/security/stats', (req, res) => {
+  try {
+    // In production, add admin authentication here
+    const stats = db.getSecurityStats();
+    res.json(stats);
+  } catch (error) {
+    console.error('Error getting security stats:', error);
+    res.status(500).json({ error: 'Failed to get security stats' });
+  }
+});
+
+app.get('/api/security/logs', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    // In production, add admin authentication here
+    const logs = db.getQueryLog(limit);
+    res.json(logs);
+  } catch (error) {
+    console.error('Error getting query logs:', error);
+    res.status(500).json({ error: 'Failed to get query logs' });
+  }
+});
+
 // Restrictive CORS configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
