@@ -620,16 +620,6 @@ app.post('/api/auctions/:id/bids',
   }
 });
 
-// Flat bid endpoint (RESTful alternative)
-app.post('/api/bids', authenticateToken, (req, res) => {
-  if (req.body.auctionId) {
-    // Redirect to the hierarchical endpoint logic internally
-    res.redirect(307, `/api/auctions/${req.body.auctionId}/bids`);
-  } else {
-    res.status(400).sendData({ error: 'auctionId is required in the body' });
-  }
-});
-
 // Use PATCH for updating auction state (RESTful)
 app.patch('/api/auctions/:id', 
   authenticateToken,
@@ -690,20 +680,8 @@ app.patch('/api/auctions/:id',
   }
 });
 
-// Alias for pluralize bid
-app.post('/api/auctions/:id/bid', (req, res) => {
-  res.redirect(307, `/api/auctions/${req.params.id}/bids`);
-});
-
-// Legacy close endpoint for backward compatibility (Optional, but let's keep it until app.js is updated)
-app.post('/api/auctions/:id/close', authenticateToken, (req, res) => {
-  // Redirect to the new PATCH endpoint logic internally
-  req.body.status = 'closed';
-  // Note: Standard recommendation is to use the new endpoint directly
-  res.redirect(307, `/api/auctions/${req.params.id}`); 
-});
-
-app.post('/api/users/register', 
+// ODHUNTER: Kept only PATCH endpoint and removed legacy /api/auctions/:id/close and /api/auctions/:id/bid
+app.post('/api/users', 
   authLimiter,
   validateSchema('registerUser'),
   validateRequest.body({
@@ -735,19 +713,7 @@ app.post('/api/users/register',
   }
 });
 
-// RESTful user registration
-app.post('/api/users', 
-  authLimiter,
-  validateSchema('registerUser'),
-  validateRequest.body({
-    username: { type: 'username', required: true },
-    password: { type: 'password', required: true }
-  }),
-  async (req, res) => {
-    // Re-use logic for registration
-    res.redirect(307, '/api/users/register');
-});
-
+// ODHUNTER: Removed legacy /api/users/login and using the standard RESTful endpoint instead
 app.post('/api/auth/login', 
   authLimiter,
   validateSchema('loginUser'),
@@ -805,11 +771,7 @@ app.post('/api/auth/login',
   }
 });
 
-// Maintain old login endpoint for compatibility
-app.post('/api/users/login', (req, res) => {
-  res.redirect(307, '/api/auth/login');
-});
-
+// ODHUNTER: Removed legacy /api/users/logout and using the standard RESTful endpoint instead
 app.post('/api/auth/logout', authenticateToken, (req, res) => {
   try {
     const authHeader = req.headers['authorization'];
@@ -825,10 +787,7 @@ app.post('/api/auth/logout', authenticateToken, (req, res) => {
   }
 });
 
-app.post('/api/users/logout', (req, res) => {
-  res.redirect(307, '/api/auth/logout');
-});
-
+// ODHUNTER: Removed legacy /api/users/verify and using the standard RESTful endpoint instead
 app.get('/api/auth/verify', authenticateToken, (req, res) => {
   res.sendData({ 
     valid: true, 
@@ -837,10 +796,6 @@ app.get('/api/auth/verify', authenticateToken, (req, res) => {
       username: req.user.username 
     } 
   }, 'verifyResponse');
-});
-
-app.get('/api/users/verify', (req, res) => {
-  res.redirect(301, '/api/auth/verify');
 });
 
 // Account lockout status endpoint
