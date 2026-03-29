@@ -14,9 +14,13 @@ const { Server, Keypair, TransactionBuilder, Networks, BASE_FEE, Asset } = requi
 const session = require('express-session');
 const passport = require('passport');
 const AuctionDatabase = require('./database');
+const EmailService = require('./utils/email-service');
 
 // Initialize database
 const db = new AuctionDatabase();
+
+// Initialize email service
+const emailService = new EmailService();
 
 const app = express();
 const server = http.createServer(app);
@@ -140,6 +144,17 @@ const createLimiter = rateLimit({
   max: 10, // limit each IP to 10 auction creations per hour
   message: {
     error: 'Too many auction creations, please try again later'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Very strict limits for password reset requests
+const passwordResetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3, // limit each IP to 3 password reset requests per hour
+  message: {
+    error: 'Too many password reset attempts, please try again later'
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -591,11 +606,12 @@ app.post('/api/users/register',
   validateSchema('registerUser'),
   validateRequest.body({
     username: { type: 'username', required: true },
-    password: { type: 'password', required: true }
+    password: { type: 'password', required: true },
+    email: { type: 'email', required: false }
   }),
   async (req, res) => {
   try {
-    const { username, password } = req.sanitizedBody;
+    const { username, password, email } = req.sanitizedBody;
     
     // Check if user already exists
     const existingUser = db.getUserByUsername(username);
@@ -603,13 +619,22 @@ app.post('/api/users/register',
       return res.status(400).json({ error: 'Username already exists' });
     }
 
+    // Check if email already exists (if provided)
+    if (email) {
+      const existingEmail = db.getUserByEmail(email);
+      if (existingEmail) {
+        return res.status(400).json({ error: 'Email already exists' });
+      }
+    }
+
     const userId = uuidv4();
     // Create user in database
-    db.createUser(userId, username, password);
+    db.createUser(userId, username, password, email);
     
     res.status(201).json({ 
       userId, 
       username,
+      email: email || null,
       message: 'User registered successfully'
     });
   } catch (error) {
@@ -680,6 +705,116 @@ app.get('/api/users/verify', authenticateToken, (req, res) => {
       username: req.user.username 
     } 
   });
+});
+
+// Password reset request endpoint
+app.post('/api/users/request-password-reset', 
+  passwordResetLimiter,
+  validateSchema('email'),
+  validateRequest.body({
+    email: { type: 'email', required: true }
+  }),
+  async (req, res) => {
+  try {
+    const { email } = req.sanitizedBody;
+    
+    // Find user by email
+    const user = db.getUserByEmail(email);
+    if (!user) {
+      // Don't reveal that the email doesn't exist for security
+      return res.json({ 
+        message: 'If an account with that email exists, a password reset link has been sent.' 
+      });
+    }
+
+    // Generate secure reset token
+    const resetToken = emailService.generateSecureToken();
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour from now
+
+    // Store reset token in database
+    db.createPasswordResetToken(user.id, resetToken, expiresAt.toISOString());
+
+    // Send reset email
+    try {
+      await emailService.sendPasswordResetEmail(email, resetToken, user.username);
+      res.json({ 
+        message: 'If an account with that email exists, a password reset link has been sent.' 
+      });
+    } catch (emailError) {
+      console.error('Failed to send password reset email:', emailError);
+      res.status(500).json({ error: 'Failed to send password reset email' });
+    }
+  } catch (error) {
+    console.error('Password reset request failed:', error);
+    res.status(500).json({ error: 'Failed to process password reset request' });
+  }
+});
+
+// Password reset confirmation endpoint
+app.post('/api/users/reset-password', 
+  passwordResetLimiter,
+  validateSchema('resetPassword'),
+  validateRequest.body({
+    token: { type: 'string', required: true },
+    newPassword: { type: 'password', required: true }
+  }),
+  async (req, res) => {
+  try {
+    const { token, newPassword } = req.sanitizedBody;
+    
+    // Validate reset token
+    const resetTokenData = db.getValidResetToken(token);
+    if (!resetTokenData) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+
+    // Get user
+    const user = db.getUserById(resetTokenData.user_id);
+    if (!user) {
+      return res.status(400).json({ error: 'Invalid reset token' });
+    }
+
+    // Update user password
+    db.updateUserPassword(user.id, newPassword);
+
+    // Invalidate the reset token
+    db.invalidateResetToken(token);
+
+    // Send confirmation email
+    try {
+      await emailService.sendPasswordResetConfirmationEmail(user.email, user.username);
+    } catch (emailError) {
+      console.error('Failed to send password reset confirmation email:', emailError);
+      // Don't fail the request if confirmation email fails
+    }
+
+    res.json({ message: 'Password has been reset successfully' });
+  } catch (error) {
+    console.error('Password reset confirmation failed:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+// Validate reset token endpoint
+app.get('/api/users/validate-reset-token/:token', 
+  validateSchema('token'),
+  validateRequest.params({
+    token: { type: 'string', required: true }
+  }),
+  (req, res) => {
+  try {
+    const { token } = req.sanitizedParams;
+    
+    const resetTokenData = db.getValidResetToken(token);
+    if (!resetTokenData) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
+
+    res.json({ valid: true });
+  } catch (error) {
+    console.error('Token validation failed:', error);
+    res.status(500).json({ error: 'Failed to validate token' });
+  }
 });
 
 // OAuth Routes (requires passport configuration)
@@ -754,6 +889,18 @@ setInterval(() => {
 const BACKUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
 setInterval(backupData, BACKUP_INTERVAL);
 console.log(`Automated backup scheduled to run every ${BACKUP_INTERVAL / 60000} minutes.`);
+
+// Schedule cleanup of expired password reset tokens
+const TOKEN_CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
+setInterval(() => {
+  try {
+    db.cleanupExpiredTokens();
+    console.log('Expired password reset tokens cleaned up successfully.');
+  } catch (error) {
+    console.error('Failed to cleanup expired tokens:', error);
+  }
+}, TOKEN_CLEANUP_INTERVAL);
+console.log(`Token cleanup scheduled to run every ${TOKEN_CLEANUP_INTERVAL / 60000} minutes.`);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
