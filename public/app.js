@@ -540,6 +540,11 @@ function switchTab(tabName) {
         AIRecommendations.refresh(window._allAuctions || auctions);
     }
     
+    // Initialize network monitor when switching to network tab
+    if (tabName === 'network' && window.networkMonitor) {
+        window.networkMonitor.showNetworkPanel();
+    }
+    
     currentTab = tabName;
 }
 
@@ -1126,12 +1131,14 @@ const VOICE_COMMANDS  = {
     'map':            () => switchTab('map'),
     'open video':     () => switchTab('video'),
     'video':          () => switchTab('video'),
+    'open network':   () => switchTab('network'),
+    'network':        () => switchTab('network'),
     'voice':          () => switchTab('voice'),
     'scroll down':    () => window.scrollBy({ top: 400, behavior: 'smooth' }),
     'scroll up':      () => window.scrollBy({ top: -400, behavior: 'smooth' }),
     'stop listening': () => stopVoiceRecognition(),
     'stop':           () => stopVoiceRecognition(),
-    'help':           () => { switchTab('voice'); speakFeedback('Available commands: show auctions, create auction, my bids, open filter, open map, open video, scroll down, scroll up, stop listening.'); },
+    'help':           () => { switchTab('voice'); speakFeedback('Available commands: show auctions, create auction, my bids, open filter, open map, open video, open network, scroll down, scroll up, stop listening.'); },
 };
 
 function initVoiceRecognition() {
@@ -1702,6 +1709,22 @@ function showSharePreview(message, url) {
     }
 }
 
+// Update user display and show analytics link
+function updateUserDisplay() {
+    const userMenu = document.getElementById('userMenu');
+    const usernameDisplay = document.getElementById('usernameDisplay');
+    const analyticsLink = document.getElementById('analyticsLink');
+    
+    if (currentUser) {
+        if (userMenu) userMenu.classList.remove('hidden');
+        if (usernameDisplay) usernameDisplay.textContent = currentUser.username || currentUser.email || 'User';
+        if (analyticsLink) analyticsLink.classList.remove('hidden');
+    } else {
+        if (userMenu) userMenu.classList.add('hidden');
+        if (analyticsLink) analyticsLink.classList.add('hidden');
+    }
+}
+
 // Add event listeners for admin filters
 document.addEventListener('DOMContentLoaded', () => {
     // User search and filters
@@ -1719,3 +1742,15 @@ document.addEventListener('DOMContentLoaded', () => {
         userStatusFilter.addEventListener('change', () => loadUsers(1));
     }
 });
+
+// Onboarding Wizard Integration
+function startOnboardingWizard() {
+    if (window.onboardingWizard) {
+        window.onboardingWizard.showHelp();
+    } else {
+        console.warn('Onboarding wizard not initialized');
+    }
+}
+
+// Make functions globally available
+window.startOnboardingWizard = startOnboardingWizard;
