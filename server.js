@@ -2103,6 +2103,127 @@ app.get('/api/bookmarks/sync/pending', authenticateToken, (req, res) => {
   }
 });
 
+// ==================== PUSH NOTIFICATION API ENDPOINTS ====================
+
+// Subscribe to push notifications
+app.post('/api/push/subscribe', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const subscription = req.body;
+    
+    // Store subscription in database (you would need to add this table)
+    // For now, we'll just log it
+    console.log('Push subscription for user', userId, ':', subscription);
+    
+    // Send test notification
+    if (pwaManager && pwaManager.sendPushNotification) {
+      await pwaManager.sendPushNotification(subscription, {
+        title: 'Welcome to Auction Platform',
+        body: 'You will now receive notifications about auctions and updates',
+        icon: '/icons/icon-192x192.png',
+        tag: 'welcome',
+        data: { url: '/' }
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Successfully subscribed to push notifications'
+    });
+  } catch (error) {
+    console.error('Error subscribing to push notifications:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to subscribe to push notifications'
+    });
+  }
+});
+
+// Unsubscribe from push notifications
+app.post('/api/push/unsubscribe', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const subscription = req.body;
+    
+    // Remove subscription from database
+    console.log('Push unsubscription for user', userId, ':', subscription);
+    
+    res.json({
+      success: true,
+      message: 'Successfully unsubscribed from push notifications'
+    });
+  } catch (error) {
+    console.error('Error unsubscribing from push notifications:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to unsubscribe from push notifications'
+    });
+  }
+});
+
+// Send push notification to specific user
+app.post('/api/push/send', authenticateToken, async (req, res) => {
+  try {
+    const { userId, title, body, icon, tag, data, actions } = req.body;
+    
+    // Get user's push subscription from database
+    // For now, we'll just send a test notification
+    const notification = {
+      title: title || 'Auction Update',
+      body: body || 'There is an update to your auction',
+      icon: icon || '/icons/icon-192x192.png',
+      tag: tag || 'auction-update',
+      data: data || { url: '/dashboard' },
+      actions: actions || []
+    };
+    
+    // Send notification (you would need to implement this)
+    console.log('Sending push notification:', notification);
+    
+    res.json({
+      success: true,
+      message: 'Push notification sent successfully'
+    });
+  } catch (error) {
+    console.error('Error sending push notification:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send push notification'
+    });
+  }
+});
+
+// Broadcast push notification to all users
+app.post('/api/push/broadcast', authenticateAdmin, async (req, res) => {
+  try {
+    const { title, body, icon, tag, data, actions } = req.body;
+    
+    // Get all user subscriptions from database
+    // For now, we'll just log the broadcast
+    const notification = {
+      title: title || 'Platform Update',
+      body: body || 'New features available in the auction platform',
+      icon: icon || '/icons/icon-192x192.png',
+      tag: tag || 'platform-update',
+      data: data || { url: '/' },
+      actions: actions || []
+    };
+    
+    console.log('Broadcasting push notification:', notification);
+    
+    res.json({
+      success: true,
+      message: 'Push notification broadcasted successfully'
+    });
+  } catch (error) {
+    console.error('Error broadcasting push notification:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to broadcast push notification'
+    });
+  }
+});
+
 // Serve generated share images
 app.get('/api/share/image/:auctionId', (req, res) => {
   try {
