@@ -317,6 +317,86 @@ class AuctionDatabase {
       CREATE INDEX IF NOT EXISTS idx_bookmark_sync_device_id ON bookmark_sync(device_id);
       CREATE INDEX IF NOT EXISTS idx_bookmark_sync_synced ON bookmark_sync(synced);
     `);
+
+    // Create chat-related tables
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_rooms (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('auction', 'global', 'private')),
+        auction_id TEXT,
+        created_by TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (created_by) REFERENCES users(id),
+        FOREIGN KEY (auction_id) REFERENCES auctions(id) ON DELETE CASCADE
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_participants (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT DEFAULT 'participant' CHECK(role IN ('admin', 'moderator', 'participant')),
+        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_read_at DATETIME,
+        is_online INTEGER DEFAULT 0,
+        FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(room_id, user_id)
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        message_type TEXT DEFAULT 'text' CHECK(message_type IN ('text', 'file', 'emoji', 'system')),
+        file_url TEXT,
+        file_name TEXT,
+        file_size INTEGER,
+        reply_to_id TEXT,
+        is_edited INTEGER DEFAULT 0,
+        edited_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (reply_to_id) REFERENCES chat_messages(id) ON DELETE SET NULL
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_typing_indicators (
+        id TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        is_typing INTEGER DEFAULT 1,
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME DEFAULT (datetime('now', '+10 seconds')),
+        FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create chat-related indexes
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_chat_rooms_type ON chat_rooms(type);
+      CREATE INDEX IF NOT EXISTS idx_chat_rooms_auction_id ON chat_rooms(auction_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_rooms_created_by ON chat_rooms(created_by);
+      CREATE INDEX IF NOT EXISTS idx_chat_participants_room_id ON chat_participants(room_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_participants_user_id ON chat_participants(user_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_participants_is_online ON chat_participants(is_online);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_user_id ON chat_messages(user_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_reply_to_id ON chat_messages(reply_to_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_typing_room_id ON chat_typing_indicators(room_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_typing_user_id ON chat_typing_indicators(user_id);
+      CREATE INDEX IF NOT EXISTS idx_chat_typing_expires_at ON chat_typing_indicators(expires_at);
+    `);
   }
 
   // User operations
@@ -2709,6 +2789,255 @@ class AuctionDatabase {
     `);
     
     return stmt.run(...recordIds);
+  }
+
+  // Chat operations
+  createChatRoom(room) {
+    const validation = this.securityLayer.validateInputs({
+      id: room.id,
+      name: room.name,
+      type: room.type,
+      auctionId: room.auctionId,
+      createdBy: room.createdBy
+    });
+    
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      INSERT INTO chat_rooms (id, name, type, auction_id, created_by)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    
+    return stmt.run(
+      validation.sanitized.id,
+      validation.sanitized.name,
+      validation.sanitized.type,
+      validation.sanitized.auctionId,
+      validation.sanitized.createdBy
+    );
+  }
+
+  getChatRoom(id) {
+    const validation = this.securityLayer.validateInput(id);
+    if (!validation.valid) {
+      throw new Error('Invalid room ID');
+    }
+    
+    const stmt = this.securityLayer.prepare('SELECT * FROM chat_rooms WHERE id = ?');
+    return stmt.get(validation.sanitized);
+  }
+
+  getChatRoomsByAuction(auctionId) {
+    const validation = this.securityLayer.validateInput(auctionId);
+    if (!validation.valid) {
+      throw new Error('Invalid auction ID');
+    }
+    
+    const stmt = this.securityLayer.prepare('SELECT * FROM chat_rooms WHERE auction_id = ?');
+    return stmt.all(validation.sanitized);
+  }
+
+  getGlobalChatRoom() {
+    const stmt = this.securityLayer.prepare("SELECT * FROM chat_rooms WHERE type = 'global' LIMIT 1");
+    return stmt.get();
+  }
+
+  addChatParticipant(participant) {
+    const validation = this.securityLayer.validateInputs({
+      id: participant.id,
+      roomId: participant.roomId,
+      userId: participant.userId,
+      role: participant.role
+    });
+    
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      INSERT OR IGNORE INTO chat_participants (id, room_id, user_id, role)
+      VALUES (?, ?, ?, ?)
+    `);
+    
+    return stmt.run(
+      validation.sanitized.id,
+      validation.sanitized.roomId,
+      validation.sanitized.userId,
+      validation.sanitized.role
+    );
+  }
+
+  getChatParticipants(roomId) {
+    const validation = this.securityLayer.validateInput(roomId);
+    if (!validation.valid) {
+      throw new Error('Invalid room ID');
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      SELECT cp.*, u.username, u.email 
+      FROM chat_participants cp
+      JOIN users u ON cp.user_id = u.id
+      WHERE cp.room_id = ?
+    `);
+    
+    return stmt.all(validation.sanitized);
+  }
+
+  updateParticipantOnlineStatus(userId, roomId, isOnline) {
+    const validation = this.securityLayer.validateInputs({ userId, roomId, isOnline });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      UPDATE chat_participants 
+      SET is_online = ?, last_read_at = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND room_id = ?
+    `);
+    
+    return stmt.run(
+      validation.sanitized.isOnline ? 1 : 0,
+      validation.sanitized.userId,
+      validation.sanitized.roomId
+    );
+  }
+
+  createChatMessage(message) {
+    const validation = this.securityLayer.validateInputs({
+      id: message.id,
+      roomId: message.roomId,
+      userId: message.userId,
+      content: message.content,
+      messageType: message.messageType,
+      fileUrl: message.fileUrl,
+      fileName: message.fileName,
+      fileSize: message.fileSize,
+      replyToId: message.replyToId
+    });
+    
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      INSERT INTO chat_messages (id, room_id, user_id, content, message_type, file_url, file_name, file_size, reply_to_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    return stmt.run(
+      validation.sanitized.id,
+      validation.sanitized.roomId,
+      validation.sanitized.userId,
+      validation.sanitized.content,
+      validation.sanitized.messageType || 'text',
+      validation.sanitized.fileUrl,
+      validation.sanitized.fileName,
+      validation.sanitized.fileSize,
+      validation.sanitized.replyToId
+    );
+  }
+
+  getChatMessages(roomId, limit = 50, offset = 0) {
+    const validation = this.securityLayer.validateInputs({ roomId, limit, offset });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      SELECT cm.*, u.username 
+      FROM chat_messages cm
+      JOIN users u ON cm.user_id = u.id
+      WHERE cm.room_id = ?
+      ORDER BY cm.created_at DESC
+      LIMIT ? OFFSET ?
+    `);
+    
+    return stmt.all(validation.sanitized.roomId, validation.sanitized.limit, validation.sanitized.offset);
+  }
+
+  editMessage(messageId, newContent) {
+    const validation = this.securityLayer.validateInputs({ messageId, newContent });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      UPDATE chat_messages 
+      SET content = ?, is_edited = 1, edited_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `);
+    
+    return stmt.run(validation.sanitized.newContent, validation.sanitized.messageId);
+  }
+
+  setTypingIndicator(roomId, userId, isTyping) {
+    const validation = this.securityLayer.validateInputs({ roomId, userId, isTyping });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    if (isTyping) {
+      const stmt = this.securityLayer.prepare(`
+        INSERT OR REPLACE INTO chat_typing_indicators (id, room_id, user_id, is_typing, started_at, expires_at)
+        VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, datetime('now', '+10 seconds'))
+      `);
+      
+      return stmt.run(
+        `${roomId}_${userId}_${Date.now()}`,
+        validation.sanitized.roomId,
+        validation.sanitized.userId
+      );
+    } else {
+      const stmt = this.securityLayer.prepare(`
+        DELETE FROM chat_typing_indicators 
+        WHERE room_id = ? AND user_id = ?
+      `);
+      
+      return stmt.run(validation.sanitized.roomId, validation.sanitized.userId);
+    }
+  }
+
+  getTypingUsers(roomId) {
+    const validation = this.securityLayer.validateInput(roomId);
+    if (!validation.valid) {
+      throw new Error('Invalid room ID');
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      SELECT cti.*, u.username 
+      FROM chat_typing_indicators cti
+      JOIN users u ON cti.user_id = u.id
+      WHERE cti.room_id = ? AND cti.expires_at > CURRENT_TIMESTAMP
+    `);
+    
+    return stmt.all(validation.sanitized.roomId);
+  }
+
+  cleanupExpiredTypingIndicators() {
+    const stmt = this.securityLayer.prepare(`
+      DELETE FROM chat_typing_indicators 
+      WHERE expires_at <= CURRENT_TIMESTAMP
+    `);
+    
+    return stmt.run();
+  }
+
+  getOnlineUsers(roomId) {
+    const validation = this.securityLayer.validateInput(roomId);
+    if (!validation.valid) {
+      throw new Error('Invalid room ID');
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      SELECT cp.*, u.username 
+      FROM chat_participants cp
+      JOIN users u ON cp.user_id = u.id
+      WHERE cp.room_id = ? AND cp.is_online = 1
+    `);
+    
+    return stmt.all(validation.sanitized.roomId);
   }
 }
 

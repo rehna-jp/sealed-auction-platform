@@ -332,6 +332,9 @@ function createAuctionCard(auction) {
                 <button onclick="openShareModal('${auction.id}', '${auction.title.replace(/'/g, "\\'")}', '${auction.startingBid}')" class="bg-green-500 hover:bg-green-600 text-white px-3 py-2 rounded-lg text-sm transition-colors" title="Share">
                     <i class="fas fa-share-alt"></i>
                 </button>
+                <button onclick="openAuctionChat('${auction.id}')" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg text-sm transition-colors" title="Chat">
+                    <i class="fas fa-comments"></i>
+                </button>
                 <button onclick="openARPreview(${auction.id})" class="bg-purple-600 hover:bg-purple-700 text-white px-3 py-2 rounded-lg text-sm transition-colors" title="AR Preview">
                     <i class="fas fa-camera"></i>
                 </button>
@@ -1752,5 +1755,17 @@ function startOnboardingWizard() {
     }
 }
 
+// Open chat function
+function openChat() {
+    window.open('/chat?global=true', '_blank');
+}
+
+// Open auction chat function
+function openAuctionChat(auctionId) {
+    window.open(`/chat?auctionId=${auctionId}`, '_blank');
+}
+
 // Make functions globally available
 window.startOnboardingWizard = startOnboardingWizard;
+window.openChat = openChat;
+window.openAuctionChat = openAuctionChat;
