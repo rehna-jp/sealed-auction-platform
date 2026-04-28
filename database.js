@@ -22,7 +22,8 @@ class AuctionDatabase {
         id TEXT PRIMARY KEY,
         username TEXT UNIQUE NOT NULL,
         email TEXT UNIQUE,
-        hashed_password TEXT NOT NULL,
+        hashed_password TEXT,
+        auth_type TEXT DEFAULT 'password' CHECK(auth_type IN ('password', 'oauth')),
         role TEXT DEFAULT 'user' CHECK(role IN ('user', 'admin', 'moderator')),
         failed_login_attempts INTEGER DEFAULT 0,
         last_failed_login DATETIME,
@@ -44,6 +45,24 @@ class AuctionDatabase {
         used INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create OAuth accounts table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS oauth_accounts (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('google', 'github', 'facebook', 'twitter')),
+        provider_id TEXT NOT NULL,
+        profile_data TEXT,
+        access_token TEXT,
+        refresh_token TEXT,
+        token_expires_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        UNIQUE(provider, provider_id)
       )
     `);
 
@@ -2872,649 +2891,131 @@ class AuctionDatabase {
     return stmt.run(...recordIds);
   }
 
-  // ==================== NFT DATABASE METHODS ====================
-
-  // NFT Collection Methods
-  createNFTCollection(collection) {
-    const validation = this.securityLayer.validateInputs(collection);
+  // OAuth operations
+  getUserByOAuthProvider(provider, providerId) {
+    const validation = this.securityLayer.validateInputs({ provider, providerId });
     if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
+      console.warn('[SECURITY] Invalid OAuth provider data:', validation.errors);
+      return null;
     }
     
     const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_collections (id, name, description, creator_id, contract_address, blockchain)
-      VALUES (?, ?, ?, ?, ?, ?)
+      SELECT u.*, oa.provider, oa.provider_id, oa.profile_data
+      FROM users u
+      JOIN oauth_accounts oa ON u.id = oa.user_id
+      WHERE oa.provider = ? AND oa.provider_id = ?
     `);
-    
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.name,
-      validation.sanitized.description,
-      validation.sanitized.creator_id,
-      validation.sanitized.contract_address,
-      validation.sanitized.blockchain
-    );
+    return stmt.get(validation.sanitized.provider, validation.sanitized.providerId);
   }
 
-  getNFTCollections() {
-    const stmt = this.securityLayer.prepare(`
-      SELECT c.*, u.username as creator_username,
-             COUNT(m.id) as nft_count
-      FROM nft_collections c
-      LEFT JOIN users u ON c.creator_id = u.id
-      LEFT JOIN nft_metadata m ON c.id = m.collection_id
-      GROUP BY c.id
-      ORDER BY c.created_at DESC
-    `);
-    return stmt.all();
-  }
-
-  // NFT Metadata Methods
-  createNFT(nft) {
-    const validation = this.securityLayer.validateInputs(nft);
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_metadata (id, token_id, collection_id, name, description, image_url, attributes, blockchain)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.token_id || this.generateTokenId(),
-      validation.sanitized.collection_id,
-      validation.sanitized.name,
-      validation.sanitized.description,
-      validation.sanitized.image_url,
-      validation.sanitized.attributes,
-      validation.sanitized.blockchain
-    );
-  }
-
-  getNFTById(id) {
-    const validation = this.securityLayer.validateInput(id);
-    if (!validation.valid) {
-      throw new Error('Invalid NFT ID');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      SELECT m.*, c.name as collection_name, c.blockchain,
-             u.username as creator_username,
-             o.owner_id, u2.username as owner_username,
-             CASE WHEN o.owner_id IS NOT NULL THEN 1 ELSE 0 END as is_owner
-      FROM nft_metadata m
-      LEFT JOIN nft_collections c ON m.collection_id = c.id
-      LEFT JOIN users u ON c.creator_id = u.id
-      LEFT JOIN nft_ownership o ON m.id = o.nft_id AND o.is_active = 1
-      LEFT JOIN users u2 ON o.owner_id = u2.id
-      WHERE m.id = ?
-    `);
-    
-    const nft = stmt.get(validation.sanitized);
-    if (nft && nft.attributes) {
-      nft.attributes = JSON.parse(nft.attributes);
-    }
-    return nft;
-  }
-
-  getNFTCollection(filters = {}) {
-    const {
-      page = 1,
-      limit = 12,
-      category = 'all',
-      verification = 'all',
-      minPrice = 0,
-      maxPrice = Infinity,
-      search = '',
-      sortBy = 'created_at',
-      sortOrder = 'desc'
-    } = filters;
-
-    const offset = (page - 1) * limit;
-    let whereConditions = [];
-    let params = [];
-
-    // Build WHERE conditions
-    if (search) {
-      whereConditions.push('(m.name LIKE ? OR m.description LIKE ? OR c.name LIKE ?)');
-      const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm);
-    }
-
-    if (category !== 'all') {
-      whereConditions.push('c.category = ?');
-      params.push(category);
-    }
-
-    if (verification !== 'all') {
-      whereConditions.push('v.status = ?');
-      params.push(verification);
-    }
-
-    if (minPrice > 0 || maxPrice < Infinity) {
-      whereConditions.push('(l.price >= ? AND l.price <= ?)');
-      params.push(minPrice, maxPrice === Infinity ? 999999999 : maxPrice);
-    }
-
-    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
-
-    // Count query
-    const countQuery = `
-      SELECT COUNT(*) as total
-      FROM nft_metadata m
-      LEFT JOIN nft_collections c ON m.collection_id = c.id
-      LEFT JOIN nft_verification v ON m.id = v.nft_id
-      LEFT JOIN nft_marketplace_listings l ON m.id = l.nft_id AND l.status = 'active'
-      ${whereClause}
-    `;
-
-    const countStmt = this.securityLayer.prepare(countQuery);
-    const totalResult = countStmt.get(...params);
-    const total = totalResult.total;
-
-    // Data query
-    const dataQuery = `
-      SELECT m.*, c.name as collection_name, c.blockchain,
-             u.username as creator_username,
-             o.owner_id, u2.username as owner_username,
-             CASE WHEN o.owner_id IS NOT NULL THEN 1 ELSE 0 END as is_owner,
-             l.price as current_price, l.currency,
-             v.status as verification_status, v.verification_type
-      FROM nft_metadata m
-      LEFT JOIN nft_collections c ON m.collection_id = c.id
-      LEFT JOIN users u ON c.creator_id = u.id
-      LEFT JOIN nft_ownership o ON m.id = o.nft_id AND o.is_active = 1
-      LEFT JOIN users u2 ON o.owner_id = u2.id
-      LEFT JOIN nft_marketplace_listings l ON m.id = l.nft_id AND l.status = 'active'
-      LEFT JOIN nft_verification v ON m.id = v.nft_id
-      ${whereClause}
-      ORDER BY m.${sortBy} ${sortOrder.toUpperCase()}
-      LIMIT ? OFFSET ?
-    `;
-
-    const dataStmt = this.securityLayer.prepare(dataQuery);
-    const data = dataStmt.all(...params, limit, offset);
-
-    // Parse JSON fields
-    data.forEach(nft => {
-      if (nft.attributes) {
-        try {
-          nft.attributes = JSON.parse(nft.attributes);
-        } catch (e) {
-          nft.attributes = null;
-        }
-      }
-    });
-
-    return {
-      data,
-      total,
-      page,
-      limit
-    };
-  }
-
-  // NFT Ownership Methods
-  createNFTOwnership(ownership) {
-    const validation = this.securityLayer.validateInputs(ownership);
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_ownership (id, nft_id, owner_id, ownership_type, acquisition_price, acquisition_currency)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.nft_id,
-      validation.sanitized.owner_id,
-      validation.sanitized.ownership_type,
-      validation.sanitized.acquisition_price,
-      validation.sanitized.acquisition_currency
-    );
-  }
-
-  getNFTOwnership(nftId, userId = null) {
-    const validation = this.securityLayer.validateInputs({ nftId, userId });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    let query = 'SELECT * FROM nft_ownership WHERE nft_id = ? AND is_active = 1';
-    const params = [validation.sanitized.nftId];
-    
-    if (userId) {
-      query += ' AND owner_id = ?';
-      params.push(validation.sanitized.userId);
-    }
-    
-    const stmt = this.securityLayer.prepare(query);
-    return userId ? stmt.get(...params) : stmt.all(...params);
-  }
-
-  updateNFTOwnership(nftId, userId, updates) {
-    const validation = this.securityLayer.validateInputs({ nftId, userId, ...updates });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const fields = [];
-    const values = [];
-    
-    Object.entries(validation.sanitized).forEach(([key, value]) => {
-      if (key !== 'nftId' && key !== 'userId') {
-        fields.push(`${key} = ?`);
-        values.push(value);
-      }
+  createOAuthUser(profileData) {
+    const validation = this.securityLayer.validateInputs({
+      id: crypto.randomUUID(),
+      username: profileData.username || profileData.name?.replace(/\s+/g, '').toLowerCase() || profileData.email?.split('@')[0],
+      email: profileData.email,
+      provider: profileData.provider,
+      providerId: profileData.providerId,
+      profileData: JSON.stringify(profileData)
     });
     
-    if (fields.length === 0) {
-      throw new Error('No valid fields to update');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      UPDATE nft_ownership 
-      SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP
-      WHERE nft_id = ? AND owner_id = ?
-    `);
-    
-    return stmt.run(...values, validation.sanitized.nftId, validation.sanitized.userId);
-  }
-
-  // NFT Marketplace Methods
-  createNFTListing(listing) {
-    const validation = this.securityLayer.validateInputs(listing);
     if (!validation.valid) {
       throw new Error(validation.errors.join(', '));
     }
     
-    const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_marketplace_listings (id, nft_id, seller_id, price, currency, listing_type, auction_end_time, reserve_price)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    const sanitized = validation.sanitized;
+    
+    // Create user account
+    const userStmt = this.securityLayer.prepare(`
+      INSERT INTO users (id, username, email, hashed_password, auth_type, created_at)
+      VALUES (?, ?, ?, ?, 'oauth', CURRENT_TIMESTAMP)
     `);
     
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.nft_id,
-      validation.sanitized.seller_id,
-      validation.sanitized.price,
-      validation.sanitized.currency,
-      validation.sanitized.listing_type,
-      validation.sanitized.auction_end_time,
-      validation.sanitized.reserve_price
-    );
+    userStmt.run(sanitized.id, sanitized.username, sanitized.email, null);
+    
+    // Create OAuth account link
+    const oauthStmt = this.securityLayer.prepare(`
+      INSERT INTO oauth_accounts (id, user_id, provider, provider_id, profile_data, created_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `);
+    
+    oauthStmt.run(crypto.randomUUID(), sanitized.id, sanitized.provider, sanitized.providerId, sanitized.profileData);
+    
+    return this.getUserById(sanitized.id);
   }
 
-  getMarketplaceListings(filters = {}) {
-    const {
-      page = 1,
-      limit = 12,
-      status = 'active',
-      listing_type = 'all',
-      sortBy = 'created_at',
-      sortOrder = 'desc'
-    } = filters;
-
-    const offset = (page - 1) * limit;
-    let whereConditions = ['l.status = ?'];
-    let params = [status];
-
-    if (listing_type !== 'all') {
-      whereConditions.push('l.listing_type = ?');
-      params.push(listing_type);
-    }
-
-    const whereClause = `WHERE ${whereConditions.join(' AND ')}`;
-
-    // Count query
-    const countQuery = `
-      SELECT COUNT(*) as total
-      FROM nft_marketplace_listings l
-      ${whereClause}
-    `;
-
-    const countStmt = this.securityLayer.prepare(countQuery);
-    const totalResult = countStmt.get(...params);
-    const total = totalResult.total;
-
-    // Data query
-    const dataQuery = `
-      SELECT l.*, m.name as nft_name, m.image_url, m.token_id,
-             c.name as collection_name, u.username as seller_username
-      FROM nft_marketplace_listings l
-      LEFT JOIN nft_metadata m ON l.nft_id = m.id
-      LEFT JOIN nft_collections c ON m.collection_id = c.id
-      LEFT JOIN users u ON l.seller_id = u.id
-      ${whereClause}
-      ORDER BY l.${sortBy} ${sortOrder.toUpperCase()}
-      LIMIT ? OFFSET ?
-    `;
-
-    const dataStmt = this.securityLayer.prepare(dataQuery);
-    const data = dataStmt.all(...params, limit, offset);
-
-    return {
-      data,
-      total,
-      page,
-      limit
-    };
-  }
-
-  // NFT Transfer Methods
-  createNFTTransfer(transfer) {
-    const validation = this.securityLayer.validateInputs(transfer);
+  linkOAuthAccount(userId, provider, providerId, profileData) {
+    const validation = this.securityLayer.validateInputs({
+      userId,
+      provider,
+      providerId,
+      profileData: JSON.stringify(profileData)
+    });
+    
     if (!validation.valid) {
       throw new Error(validation.errors.join(', '));
     }
     
+    const sanitized = validation.sanitized;
+    
     const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_transfer_history (id, nft_id, from_owner_id, to_owner_id, transfer_type, price, currency)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO oauth_accounts (id, user_id, provider, provider_id, profile_data, created_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `);
     
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.nft_id,
-      validation.sanitized.from_owner_id,
-      validation.sanitized.to_owner_id,
-      validation.sanitized.transfer_type,
-      validation.sanitized.price,
-      validation.sanitized.currency
-    );
+    return stmt.run(crypto.randomUUID(), sanitized.userId, sanitized.provider, sanitized.providerId, sanitized.profileData);
   }
 
-  getNFTTransactionHistory(nftId) {
-    const validation = this.securityLayer.validateInput(nftId);
+  updateOAuthUserProfile(userId, profileData) {
+    const validation = this.securityLayer.validateInputs({
+      userId,
+      profileData: JSON.stringify(profileData)
+    });
+    
     if (!validation.valid) {
-      throw new Error('Invalid NFT ID');
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const sanitized = validation.sanitized;
+    
+    const stmt = this.securityLayer.prepare(`
+      UPDATE oauth_accounts 
+      SET profile_data = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND provider = ?
+    `);
+    
+    return stmt.run(sanitized.profileData, sanitized.userId, profileData.provider);
+  }
+
+  getUserOAuthAccounts(userId) {
+    const validation = this.securityLayer.validateInput(userId);
+    if (!validation.valid) {
+      console.warn('[SECURITY] Invalid user ID format:', userId);
+      return [];
     }
     
     const stmt = this.securityLayer.prepare(`
-      SELECT t.*, u1.username as from_owner_username, u2.username as to_owner_username
-      FROM nft_transfer_history t
-      LEFT JOIN users u1 ON t.from_owner_id = u1.id
-      LEFT JOIN users u2 ON t.to_owner_id = u2.id
-      WHERE t.nft_id = ?
-      ORDER BY t.created_at DESC
+      SELECT provider, provider_id, profile_data, created_at
+      FROM oauth_accounts
+      WHERE user_id = ?
+      ORDER BY created_at DESC
     `);
-    
     return stmt.all(validation.sanitized);
   }
 
-  processNFTTransfer(nftId, fromUserId, toUserId, transferType, price = null) {
-    const validation = this.securityLayer.validateInputs({ 
-      nftId, 
-      fromUserId, 
-      toUserId, 
-      transferType, 
-      price 
-    });
-    
+  unlinkOAuthAccount(userId, provider) {
+    const validation = this.securityLayer.validateInputs({ userId, provider });
     if (!validation.valid) {
       throw new Error(validation.errors.join(', '));
     }
     
-    const transfer = {
-      id: this.generateId(),
-      nft_id: validation.sanitized.nftId,
-      from_owner_id: validation.sanitized.fromUserId,
-      to_owner_id: validation.sanitized.toUserId,
-      transfer_type: validation.sanitized.transferType,
-      price: validation.sanitized.price,
-      currency: 'USD'
-    };
-    
-    this.createNFTTransfer(transfer);
-    return transfer;
-  }
-
-  // NFT Verification Methods
-  createNFTVerification(verification) {
-    const validation = this.securityLayer.validateInputs(verification);
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
+    const sanitized = validation.sanitized;
     
     const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_verification (id, nft_id, verification_type, status)
-      VALUES (?, ?, ?, ?)
+      DELETE FROM oauth_accounts
+      WHERE user_id = ? AND provider = ?
     `);
     
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.nft_id,
-      validation.sanitized.verification_type,
-      validation.sanitized.status
-    );
-  }
-
-  getNFTVerification(nftId) {
-    const validation = this.securityLayer.validateInput(nftId);
-    if (!validation.valid) {
-      throw new Error('Invalid NFT ID');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      SELECT * FROM nft_verification WHERE nft_id = ?
-      ORDER BY created_at DESC
-      LIMIT 1
-    `);
-    
-    const verification = stmt.get(validation.sanitized);
-    if (verification && verification.verification_data) {
-      try {
-        verification.verification_data = JSON.parse(verification.verification_data);
-      } catch (e) {
-        verification.verification_data = null;
-      }
-    }
-    return verification;
-  }
-
-  updateNFTVerification(verificationId, updates) {
-    const validation = this.securityLayer.validateInputs({ verificationId, ...updates });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const fields = [];
-    const values = [];
-    
-    Object.entries(validation.sanitized).forEach(([key, value]) => {
-      if (key !== 'verificationId') {
-        if (key === 'verification_data' && typeof value === 'object') {
-          fields.push(`${key} = ?`);
-          values.push(JSON.stringify(value));
-        } else {
-          fields.push(`${key} = ?`);
-          values.push(value);
-        }
-      }
-    });
-    
-    if (fields.length === 0) {
-      throw new Error('No valid fields to update');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      UPDATE nft_verification 
-      SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
-    
-    return stmt.run(...values, validation.sanitized.verificationId);
-  }
-
-  // NFT Offer Methods
-  createNFTOffer(offer) {
-    const validation = this.securityLayer.validateInputs(offer);
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      INSERT INTO nft_offers (id, nft_id, offerer_id, price, currency, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    
-    return stmt.run(
-      validation.sanitized.id || this.generateId(),
-      validation.sanitized.nft_id,
-      validation.sanitized.offerer_id,
-      validation.sanitized.price,
-      validation.sanitized.currency,
-      validation.sanitized.expires_at
-    );
-  }
-
-  getNFTOfferById(offerId) {
-    const validation = this.securityLayer.validateInput(offerId);
-    if (!validation.valid) {
-      throw new Error('Invalid offer ID');
-    }
-    
-    const stmt = this.securityLayer.prepare('SELECT * FROM nft_offers WHERE id = ?');
-    return stmt.get(validation.sanitized);
-  }
-
-  updateNFTOffer(offerId, updates) {
-    const validation = this.securityLayer.validateInputs({ offerId, ...updates });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
-    const fields = [];
-    const values = [];
-    
-    Object.entries(validation.sanitized).forEach(([key, value]) => {
-      if (key !== 'offerId') {
-        fields.push(`${key} = ?`);
-        values.push(value);
-      }
-    });
-    
-    if (fields.length === 0) {
-      throw new Error('No valid fields to update');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      UPDATE nft_offers 
-      SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `);
-    
-    return stmt.run(...values, validation.sanitized.offerId);
-  }
-
-  // User Portfolio Methods
-  getUserNFTPortfolio(userId) {
-    const validation = this.securityLayer.validateInput(userId);
-    if (!validation.valid) {
-      throw new Error('Invalid user ID');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      SELECT m.*, c.name as collection_name, c.blockchain,
-             o.acquired_at, o.acquisition_price, o.ownership_type,
-             l.price as current_price, l.currency as listing_currency
-      FROM nft_ownership o
-      LEFT JOIN nft_metadata m ON o.nft_id = m.id
-      LEFT JOIN nft_collections c ON m.collection_id = c.id
-      LEFT JOIN nft_marketplace_listings l ON m.id = l.nft_id AND l.status = 'active'
-      WHERE o.owner_id = ? AND o.is_active = 1
-      ORDER BY o.acquired_at DESC
-    `);
-    
-    const portfolio = stmt.all(validation.sanitized);
-    
-    // Calculate portfolio stats
-    const totalValue = portfolio.reduce((sum, item) => {
-      return sum + (item.current_price || item.acquisition_price || 0);
-    }, 0);
-    
-    return {
-      nfts: portfolio,
-      stats: {
-        total_nfts: portfolio.length,
-        total_value: totalValue,
-        total_invested: portfolio.reduce((sum, item) => sum + (item.acquisition_price || 0), 0),
-        listed_for_sale: portfolio.filter(item => item.ownership_type === 'listed').length
-      }
-    };
-  }
-
-  // Market Statistics Methods
-  getNFTMarketStats(period = '30d') {
-    const validation = this.securityLayer.validateInput(period);
-    if (!validation.valid) {
-      throw new Error('Invalid period');
-    }
-    
-    const days = parseInt(period.replace('d', '')) || 30;
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    
-    // Total volume
-    const volumeStmt = this.securityLayer.prepare(`
-      SELECT SUM(price) as total_volume, COUNT(*) as total_transactions
-      FROM nft_transfer_history 
-      WHERE transfer_type = 'sale' AND created_at >= ?
-    `);
-    const volume = volumeStmt.get(validation.sanitized);
-    
-    // Active listings
-    const listingsStmt = this.securityLayer.prepare(`
-      SELECT COUNT(*) as active_listings, AVG(price) as avg_price
-      FROM nft_marketplace_listings 
-      WHERE status = 'active'
-    `);
-    const listings = listingsStmt.get();
-    
-    // Total NFTs and collections
-    const nftsStmt = this.securityLayer.prepare(`
-      SELECT COUNT(*) as total_nfts
-      FROM nft_metadata
-    `);
-    const nfts = nftsStmt.get();
-    
-    const collectionsStmt = this.securityLayer.prepare(`
-      SELECT COUNT(*) as total_collections
-      FROM nft_collections
-    `);
-    const collections = collectionsStmt.get();
-    
-    return {
-      period: validation.sanitized.period,
-      total_volume: volume.total_volume || 0,
-      total_transactions: volume.total_transactions || 0,
-      active_listings: listings.active_listings || 0,
-      average_price: listings.avg_price || 0,
-      total_nfts: nfts.total_nfts || 0,
-      total_collections: collections.total_collections || 0
-    };
-  }
-
-  // Helper Methods
-  generateTokenId() {
-    return Math.floor(Math.random() * 1000000).toString();
-  }
-
-  getUserByWalletAddress(address) {
-    const validation = this.securityLayer.validateInput(address);
-    if (!validation.valid) {
-      throw new Error('Invalid wallet address');
-    }
-    
-    const stmt = this.securityLayer.prepare('SELECT * FROM users WHERE wallet_address = ?');
-    return stmt.get(validation.sanitized);
-  }
-
-  generateId() {
-    return require('uuid').v4();
+    return stmt.run(sanitized.userId, sanitized.provider);
   }
 }
 
