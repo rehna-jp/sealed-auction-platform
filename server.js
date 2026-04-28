@@ -27,6 +27,7 @@ const GitHubStrategy = require('passport-github2').Strategy;
 const AuctionDatabase = require('./database');
 const { ApplicationMetrics, createMetricsMiddleware } = require('./utils/metrics');
 const NetworkMonitor = require('./utils/network-monitor');
+const multer = require('multer');
 const { TransactionQueue, PRIORITY, STATUS } = require('./utils/transaction-queue');
 const { WalletManager, SECURITY_LEVELS, WALLET_TYPES } = require('./utils/wallet-manager');
 const { BlockchainAnalytics, AGGREGATION_INTERVALS, METRIC_TYPES } = require('./utils/blockchain-analytics');
@@ -37,6 +38,30 @@ const db = new AuctionDatabase();
 // Initialize network monitor
 const networkMonitor = new NetworkMonitor();
 
+// Configure multer for file uploads
+const upload = multer({
+  dest: 'uploads/',
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow common file types
+    const allowedTypes = /jpeg|jpg|png|gif|pdf|doc|docx|txt|zip|rar/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images, documents, and archives are allowed.'));
+    }
+  }
+});
+
+// Create uploads directory if it doesn't exist
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
 // Initialize transaction queue
 const transactionQueue = new TransactionQueue({
   networkMonitor: networkMonitor,
@@ -3084,6 +3109,259 @@ app.get('/bookmarks', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'bookmarks.html'));
 });
 
+// Chat route
+app.get('/chat', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'chat.html'));
+});
+
+// ==================== CHAT API ENDPOINTS ====================
+
+// Get or create global chat room
+app.get('/api/chat/global', authenticateToken, (req, res) => {
+  try {
+    let globalRoom = db.getGlobalChatRoom();
+    
+    if (!globalRoom) {
+      // Create global chat room if it doesn't exist
+      const roomId = uuidv4();
+      db.createChatRoom({
+        id: roomId,
+        name: 'Global Chat',
+        type: 'global',
+        auctionId: null,
+        createdBy: 'system'
+      });
+      globalRoom = db.getChatRoom(roomId);
+    }
+    
+    // Add user as participant if not already
+    const participantId = uuidv4();
+    db.addChatParticipant({
+      id: participantId,
+      roomId: globalRoom.id,
+      userId: req.user.id,
+      role: 'participant'
+    });
+    
+    res.json({
+      success: true,
+      room: globalRoom
+    });
+  } catch (error) {
+    logError('Error getting global chat room:', error, { endpoint: '/api/chat/global' });
+    res.status(500).json({ error: 'Failed to get global chat room' });
+  }
+});
+
+// Get auction chat room
+app.get('/api/chat/auction/:auctionId', authenticateToken, (req, res) => {
+  try {
+    const { auctionId } = req.params;
+    
+    // Check if auction exists
+    const auction = db.getAuction(auctionId);
+    if (!auction) {
+      return res.status(404).json({ error: 'Auction not found' });
+    }
+    
+    // Get or create auction chat room
+    let auctionRoom = db.getChatRoomsByAuction(auctionId)[0];
+    
+    if (!auctionRoom) {
+      const roomId = uuidv4();
+      db.createChatRoom({
+        id: roomId,
+        name: `${auction.title} - Chat`,
+        type: 'auction',
+        auctionId: auctionId,
+        createdBy: auction.creator_id
+      });
+      auctionRoom = db.getChatRoom(roomId);
+    }
+    
+    // Add user as participant if not already
+    const participantId = uuidv4();
+    db.addChatParticipant({
+      id: participantId,
+      roomId: auctionRoom.id,
+      userId: req.user.id,
+      role: 'participant'
+    });
+    
+    res.json({
+      success: true,
+      room: auctionRoom
+    });
+  } catch (error) {
+    logError('Error getting auction chat room:', error, { endpoint: '/api/chat/auction/:auctionId' });
+    res.status(500).json({ error: 'Failed to get auction chat room' });
+  }
+});
+
+// Get chat messages
+app.get('/api/chat/:roomId/messages', authenticateToken, (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    
+    // Verify user is participant in the room
+    const participants = db.getChatParticipants(roomId);
+    const isParticipant = participants.some(p => p.user_id === req.user.id);
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Access denied to this chat room' });
+    }
+    
+    const messages = db.getChatMessages(roomId, limit, offset);
+    
+    res.json({
+      success: true,
+      messages: messages.reverse() // Return in chronological order
+    });
+  } catch (error) {
+    logError('Error getting chat messages:', error, { endpoint: '/api/chat/:roomId/messages' });
+    res.status(500).json({ error: 'Failed to get messages' });
+  }
+});
+
+// Send chat message
+app.post('/api/chat/:roomId/messages', authenticateToken, (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { content, messageType = 'text', replyToId } = req.body;
+    
+    if (!content || content.trim() === '') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+    
+    // Verify user is participant in the room
+    const participants = db.getChatParticipants(roomId);
+    const isParticipant = participants.some(p => p.user_id === req.user.id);
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Access denied to this chat room' });
+    }
+    
+    const messageId = uuidv4();
+    db.createChatMessage({
+      id: messageId,
+      roomId: roomId,
+      userId: req.user.id,
+      content: content.trim(),
+      messageType: messageType,
+      replyToId: replyToId
+    });
+    
+    // Get the created message with user info
+    const messages = db.getChatMessages(roomId, 1, 0);
+    const newMessage = messages[0];
+    
+    // Emit to all participants in the room
+    io.to(roomId).emit('newMessage', {
+      roomId: roomId,
+      message: newMessage
+    });
+    
+    res.json({
+      success: true,
+      message: newMessage
+    });
+  } catch (error) {
+    logError('Error sending chat message:', error, { endpoint: '/api/chat/:roomId/messages' });
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Edit chat message
+app.patch('/api/chat/messages/:messageId', authenticateToken, (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const { content } = req.body;
+    
+    if (!content || content.trim() === '') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+    
+    // Get the message to verify ownership
+    const messages = db.getChatMessages('dummy', 100, 0); // Get recent messages to find the one
+    const message = messages.find(m => m.id === messageId);
+    
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    
+    if (message.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'Can only edit your own messages' });
+    }
+    
+    db.editMessage(messageId, content.trim());
+    
+    // Emit to all participants in the room
+    io.to(message.room_id).emit('messageEdited', {
+      roomId: message.room_id,
+      messageId: messageId,
+      newContent: content.trim(),
+      editedAt: new Date().toISOString()
+    });
+    
+    res.json({
+      success: true,
+      message: 'Message edited successfully'
+    });
+  } catch (error) {
+    logError('Error editing chat message:', error, { endpoint: '/api/chat/messages/:messageId' });
+    res.status(500).json({ error: 'Failed to edit message' });
+  }
+});
+
+// Upload file for chat
+app.post('/api/chat/upload', authenticateToken, upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const fileUrl = `/uploads/${req.file.filename}`;
+    
+    res.json({
+      success: true,
+      file: {
+        url: fileUrl,
+        name: req.file.originalname,
+        size: req.file.size,
+        type: req.file.mimetype
+      }
+    });
+  } catch (error) {
+    logError('Error uploading chat file:', error, { endpoint: '/api/chat/upload' });
+    res.status(500).json({ error: 'Failed to upload file' });
+  }
+});
+
+// Get chat participants
+app.get('/api/chat/:roomId/participants', authenticateToken, (req, res) => {
+  try {
+    const { roomId } = req.params;
+    
+    // Verify user is participant in the room
+    const participants = db.getChatParticipants(roomId);
+    const isParticipant = participants.some(p => p.user_id === req.user.id);
+    
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Access denied to this chat room' });
+    }
+    
+    res.json({
+      success: true,
+      participants: participants
+    });
+  } catch (error) {
+    logError('Error getting chat participants:', error, { endpoint: '/api/chat/:roomId/participants' });
+    res.status(500).json({ error: 'Failed to get participants' });
+  }
+});
+
 // Socket.io connections
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
@@ -3097,8 +3375,132 @@ io.on('connection', (socket) => {
     console.log('User joined dashboard room:', socket.id);
   });
   
+  // Chat event handlers
+  socket.on('joinChatRoom', (data) => {
+    const { roomId, userId } = data;
+    socket.join(roomId);
+    console.log(`User ${userId} joined chat room ${roomId}`);
+    
+    // Update user's online status
+    db.updateParticipantOnlineStatus(userId, roomId, true);
+    
+    // Notify others in the room
+    socket.to(roomId).emit('userJoined', {
+      roomId: roomId,
+      userId: userId,
+      onlineUsers: db.getOnlineUsers(roomId)
+    });
+  });
+  
+  socket.on('leaveChatRoom', (data) => {
+    const { roomId, userId } = data;
+    socket.leave(roomId);
+    console.log(`User ${userId} left chat room ${roomId}`);
+    
+    // Update user's online status
+    db.updateParticipantOnlineStatus(userId, roomId, false);
+    
+    // Notify others in the room
+    socket.to(roomId).emit('userLeft', {
+      roomId: roomId,
+      userId: userId,
+      onlineUsers: db.getOnlineUsers(roomId)
+    });
+  });
+  
+  socket.on('typing', (data) => {
+    const { roomId, userId, isTyping } = data;
+    
+    // Update typing indicator in database
+    db.setTypingIndicator(roomId, userId, isTyping);
+    
+    // Notify others in the room
+    socket.to(roomId).emit('userTyping', {
+      roomId: roomId,
+      userId: userId,
+      isTyping: isTyping,
+      typingUsers: db.getTypingUsers(roomId)
+    });
+  });
+  
+  socket.on('sendMessage', async (data) => {
+    const { roomId, userId, content, messageType = 'text', replyToId } = data;
+    
+    try {
+      // Verify user is participant in the room
+      const participants = db.getChatParticipants(roomId);
+      const isParticipant = participants.some(p => p.user_id === userId);
+      
+      if (!isParticipant) {
+        socket.emit('error', { message: 'Access denied to this chat room' });
+        return;
+      }
+      
+      const messageId = uuidv4();
+      db.createChatMessage({
+        id: messageId,
+        roomId: roomId,
+        userId: userId,
+        content: content.trim(),
+        messageType: messageType,
+        replyToId: replyToId
+      });
+      
+      // Get the created message with user info
+      const messages = db.getChatMessages(roomId, 1, 0);
+      const newMessage = messages[0];
+      
+      // Emit to all participants in the room
+      io.to(roomId).emit('newMessage', {
+        roomId: roomId,
+        message: newMessage
+      });
+      
+    } catch (error) {
+      console.error('Error sending message:', error);
+      socket.emit('error', { message: 'Failed to send message' });
+    }
+  });
+  
+  socket.on('editMessage', async (data) => {
+    const { messageId, userId, newContent } = data;
+    
+    try {
+      // Get the message to verify ownership
+      const messages = db.getChatMessages('dummy', 100, 0);
+      const message = messages.find(m => m.id === messageId);
+      
+      if (!message) {
+        socket.emit('error', { message: 'Message not found' });
+        return;
+      }
+      
+      if (message.user_id !== userId) {
+        socket.emit('error', { message: 'Can only edit your own messages' });
+        return;
+      }
+      
+      db.editMessage(messageId, newContent.trim());
+      
+      // Emit to all participants in the room
+      io.to(message.room_id).emit('messageEdited', {
+        roomId: message.room_id,
+        messageId: messageId,
+        newContent: newContent.trim(),
+        editedAt: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('Error editing message:', error);
+      socket.emit('error', { message: 'Failed to edit message' });
+    }
+  });
+  
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
+    
+    // Clean up typing indicators for disconnected user
+    db.cleanupExpiredTypingIndicators();
   });
 });
 
