@@ -322,6 +322,66 @@ class AuctionDatabase {
       )
     `);
 
+    // Create watchlist table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchlist (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        auction_id TEXT NOT NULL,
+        notification_preferences TEXT DEFAULT '{"price_change": true, "ending_soon": true, "new_bid": true}',
+        price_threshold REAL,
+        notes TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (auction_id) REFERENCES auctions(id) ON DELETE CASCADE,
+        UNIQUE(user_id, auction_id)
+      )
+    `);
+
+    // Create watchlist notifications table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchlist_notifications (
+        id TEXT PRIMARY KEY,
+        watchlist_id TEXT NOT NULL,
+        notification_type TEXT NOT NULL CHECK(notification_type IN ('price_change', 'ending_soon', 'auction_ended', 'new_bid', 'outbid')),
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        is_read INTEGER DEFAULT 0,
+        is_sent INTEGER DEFAULT 0,
+        sent_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (watchlist_id) REFERENCES watchlist(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create watchlist sharing table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchlist_shares (
+        id TEXT PRIMARY KEY,
+        watchlist_owner_id TEXT NOT NULL,
+        share_token TEXT UNIQUE NOT NULL,
+        share_url TEXT NOT NULL,
+        is_public INTEGER DEFAULT 0,
+        expires_at DATETIME,
+        view_count INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (watchlist_owner_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create watchlist activity log
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS watchlist_activity (
+        id TEXT PRIMARY KEY,
+        watchlist_id TEXT NOT NULL,
+        activity_type TEXT NOT NULL CHECK(activity_type IN ('added', 'removed', 'price_alert_triggered', 'ending_soon_alert', 'notification_sent')),
+        details TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (watchlist_id) REFERENCES watchlist(id) ON DELETE CASCADE
+      )
+    `);
+
     // Create indexes for better performance
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status);
@@ -362,6 +422,18 @@ class AuctionDatabase {
       CREATE INDEX IF NOT EXISTS idx_bookmark_sync_user_id ON bookmark_sync(user_id);
       CREATE INDEX IF NOT EXISTS idx_bookmark_sync_device_id ON bookmark_sync(device_id);
       CREATE INDEX IF NOT EXISTS idx_bookmark_sync_synced ON bookmark_sync(synced);
+      
+      -- Watchlist-related indexes
+      CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON watchlist(user_id);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_auction_id ON watchlist(auction_id);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_created_at ON watchlist(created_at);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_notifications_watchlist_id ON watchlist_notifications(watchlist_id);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_notifications_type ON watchlist_notifications(notification_type);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_notifications_is_read ON watchlist_notifications(is_read);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_shares_owner_id ON watchlist_shares(watchlist_owner_id);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_shares_token ON watchlist_shares(share_token);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_activity_watchlist_id ON watchlist_activity(watchlist_id);
+      CREATE INDEX IF NOT EXISTS idx_watchlist_activity_type ON watchlist_activity(activity_type);
     `);
 
     // Create chat-related tables
@@ -3240,14 +3312,349 @@ class AuctionDatabase {
     return stmt.run(...recordIds);
   }
 
-  // Chat operations
-  createChatRoom(room) {
+  // ==================== WATCHLIST OPERATIONS ====================
+
+  addToWatchlist(watchlistItem) {
     const validation = this.securityLayer.validateInputs({
-      id: room.id,
-      name: room.name,
-      type: room.type,
-      auctionId: room.auctionId,
-      createdBy: room.createdBy
+      id: watchlistItem.id,
+      userId: watchlistItem.userId,
+      auctionId: watchlistItem.auctionId,
+      notificationPreferences: watchlistItem.notificationPreferences,
+      priceThreshold: watchlistItem.priceThreshold,
+      notes: watchlistItem.notes
+    });
+    
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    try {
+      const stmt = this.securityLayer.prepare(`
+        INSERT INTO watchlist (id, user_id, auction_id, notification_preferences, price_threshold, notes)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      
+      const result = stmt.run(
+        validation.sanitized.id,
+        validation.sanitized.userId,
+        validation.sanitized.auctionId,
+        JSON.stringify(validation.sanitized.notificationPreferences || {}),
+        validation.sanitized.priceThreshold || null,
+        validation.sanitized.notes || null
+      );
+      
+      // Log activity
+      this.logWatchlistActivity(validation.sanitized.id, 'added', {
+        auctionId: validation.sanitized.auctionId
+      });
+      
+      return result;
+    } catch (error) {
+      if (error.message.includes('UNIQUE constraint failed')) {
+        throw new Error('Auction is already in watchlist');
+      }
+      throw error;
+    }
+  }
+
+  removeFromWatchlist(userId, auctionId) {
+    const validation = this.securityLayer.validateInputs({ userId, auctionId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    // Get watchlist item ID before deletion for activity logging
+    const watchlistItem = this.getWatchlistItem(userId, auctionId);
+    
+    const stmt = this.securityLayer.prepare(`
+      DELETE FROM watchlist 
+      WHERE user_id = ? AND auction_id = ?
+    `);
+    
+    const result = stmt.run(validation.sanitized.userId, validation.sanitized.auctionId);
+    
+    if (result.changes > 0 && watchlistItem) {
+      // Log activity
+      this.logWatchlistActivity(watchlistItem.id, 'removed', {
+        auctionId: validation.sanitized.auctionId
+      });
+    }
+    
+    return result;
+  }
+
+  getWatchlist(userId, options = {}) {
+    const validation = this.securityLayer.validateInputs({ userId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    let query = `
+      SELECT w.*, a.title, a.description, a.starting_bid, a.current_highest_bid, 
+             a.end_time, a.status, a.creator_id, u.username as creator_username
+      FROM watchlist w
+      JOIN auctions a ON w.auction_id = a.id
+      JOIN users u ON a.creator_id = u.id
+      WHERE w.user_id = ?
+    `;
+    
+    const params = [validation.sanitized.userId];
+    
+    // Add filtering options
+    if (options.status) {
+      query += ' AND a.status = ?';
+      params.push(options.status);
+    }
+    
+    if (options.sortBy) {
+      const sortField = options.sortBy === 'end_time' ? 'a.end_time' : 
+                       options.sortBy === 'current_bid' ? 'a.current_highest_bid' : 
+                       'w.created_at';
+      const sortOrder = options.sortOrder === 'asc' ? 'ASC' : 'DESC';
+      query += ` ORDER BY ${sortField} ${sortOrder}`;
+    } else {
+      query += ' ORDER BY w.created_at DESC';
+    }
+    
+    // Add pagination
+    if (options.limit) {
+      query += ' LIMIT ?';
+      params.push(options.limit);
+      
+      if (options.offset) {
+        query += ' OFFSET ?';
+        params.push(options.offset);
+      }
+    }
+    
+    const stmt = this.securityLayer.prepare(query);
+    const items = stmt.all(...params);
+    
+    return items.map(item => ({
+      ...item,
+      notification_preferences: JSON.parse(item.notification_preferences || '{}')
+    }));
+  }
+
+  getWatchlistItem(userId, auctionId) {
+    const validation = this.securityLayer.validateInputs({ userId, auctionId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      SELECT * FROM watchlist 
+      WHERE user_id = ? AND auction_id = ?
+    `);
+    
+    const item = stmt.get(validation.sanitized.userId, validation.sanitized.auctionId);
+    
+    if (item) {
+      item.notification_preferences = JSON.parse(item.notification_preferences || '{}');
+    }
+    
+    return item;
+  }
+
+  updateWatchlistItem(userId, auctionId, updates) {
+    const validation = this.securityLayer.validateInputs({ userId, auctionId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const allowedFields = ['notification_preferences', 'price_threshold', 'notes'];
+    const updateFields = [];
+    const updateValues = [];
+    
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedFields.includes(key)) {
+        updateFields.push(`${key} = ?`);
+        updateValues.push(key === 'notification_preferences' ? JSON.stringify(value) : value);
+      }
+    }
+    
+    if (updateFields.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+    
+    updateFields.push('updated_at = CURRENT_TIMESTAMP');
+    updateValues.push(validation.sanitized.userId, validation.sanitized.auctionId);
+    
+    const stmt = this.securityLayer.prepare(`
+      UPDATE watchlist 
+      SET ${updateFields.join(', ')}
+      WHERE user_id = ? AND auction_id = ?
+    `);
+    
+    return stmt.run(...updateValues);
+  }
+
+  bulkAddToWatchlist(userId, auctionIds) {
+    const validation = this.securityLayer.validateInputs({ userId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const results = { added: 0, skipped: 0, errors: [] };
+    
+    for (const auctionId of auctionIds) {
+      try {
+        const auctionValidation = this.securityLayer.validateInput(auctionId);
+        if (!auctionValidation.valid) {
+          results.errors.push(`Invalid auction ID: ${auctionId}`);
+          continue;
+        }
+        
+        // Check if auction exists
+        const auction = this.getAuction(auctionValidation.sanitized);
+        if (!auction) {
+          results.errors.push(`Auction not found: ${auctionId}`);
+          continue;
+        }
+        
+        // Check if already in watchlist
+        const existing = this.getWatchlistItem(validation.sanitized.userId, auctionValidation.sanitized);
+        if (existing) {
+          results.skipped++;
+          continue;
+        }
+        
+        const watchlistItem = {
+          id: crypto.randomUUID(),
+          userId: validation.sanitized.userId,
+          auctionId: auctionValidation.sanitized
+        };
+        
+        this.addToWatchlist(watchlistItem);
+        results.added++;
+      } catch (error) {
+        results.errors.push(`Error adding auction ${auctionId}: ${error.message}`);
+      }
+    }
+    
+    return results;
+  }
+
+  bulkRemoveFromWatchlist(userId, auctionIds) {
+    const validation = this.securityLayer.validateInputs({ userId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const results = { removed: 0, errors: [] };
+    
+    for (const auctionId of auctionIds) {
+      try {
+        const auctionValidation = this.securityLayer.validateInput(auctionId);
+        if (!auctionValidation.valid) {
+          results.errors.push(`Invalid auction ID: ${auctionId}`);
+          continue;
+        }
+        
+        const result = this.removeFromWatchlist(validation.sanitized.userId, auctionValidation.sanitized);
+        if (result.changes > 0) {
+          results.removed++;
+        }
+      } catch (error) {
+        results.errors.push(`Error removing auction ${auctionId}: ${error.message}`);
+      }
+    }
+    
+    return results;
+  }
+
+  createWatchlistShare(userId, shareOptions = {}) {
+    const validation = this.securityLayer.validateInputs({ userId });
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const shareToken = crypto.randomUUID();
+    const shareUrl = `${shareOptions.baseUrl || 'https://localhost:3000'}/watchlist/shared/${shareToken}`;
+    
+    const stmt = this.securityLayer.prepare(`
+      INSERT INTO watchlist_shares (id, watchlist_owner_id, share_token, share_url, is_public, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    
+    const shareId = crypto.randomUUID();
+    const expiresAt = shareOptions.expiresInHours ? 
+      new Date(Date.now() + shareOptions.expiresInHours * 60 * 60 * 1000).toISOString() : 
+      null;
+    
+    const result = stmt.run(
+      shareId,
+      validation.sanitized.userId,
+      shareToken,
+      shareUrl,
+      shareOptions.isPublic ? 1 : 0,
+      expiresAt
+    );
+    
+    return {
+      id: shareId,
+      shareToken,
+      shareUrl,
+      expiresAt
+    };
+  }
+
+  getSharedWatchlist(shareToken) {
+    const validation = this.securityLayer.validateInput(shareToken);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    // Check if share exists and is valid
+    const shareStmt = this.securityLayer.prepare(`
+      SELECT * FROM watchlist_shares 
+      WHERE share_token = ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+    `);
+    const share = shareStmt.get(validation.sanitized);
+    
+    if (!share) {
+      throw new Error('Shared watchlist not found or expired');
+    }
+    
+    // Increment view count
+    const incrementStmt = this.securityLayer.prepare(`
+      UPDATE watchlist_shares 
+      SET view_count = view_count + 1 
+      WHERE share_token = ?
+    `);
+    incrementStmt.run(validation.sanitized);
+    
+    // Get watchlist items
+    const watchlistStmt = this.securityLayer.prepare(`
+      SELECT w.*, a.title, a.description, a.starting_bid, a.current_highest_bid, 
+             a.end_time, a.status, a.creator_id, u.username as creator_username
+      FROM watchlist w
+      JOIN auctions a ON w.auction_id = a.id
+      JOIN users u ON a.creator_id = u.id
+      WHERE w.user_id = ?
+      ORDER BY w.created_at DESC
+    `);
+    
+    const items = watchlistStmt.all(share.watchlist_owner_id);
+    
+    return {
+      shareInfo: {
+        ...share,
+        is_public: Boolean(share.is_public)
+      },
+      items: items.map(item => ({
+        ...item,
+        notification_preferences: JSON.parse(item.notification_preferences || '{}')
+      }))
+    };
+  }
+
+  createWatchlistNotification(watchlistId, notificationType, title, message) {
+    const validation = this.securityLayer.validateInputs({
+      watchlistId,
+      notificationType,
+      title,
+      message
     });
     
     if (!validation.valid) {
@@ -3255,50 +3662,74 @@ class AuctionDatabase {
     }
     
     const stmt = this.securityLayer.prepare(`
-      INSERT INTO chat_rooms (id, name, type, auction_id, created_by)
+      INSERT INTO watchlist_notifications (id, watchlist_id, notification_type, title, message)
       VALUES (?, ?, ?, ?, ?)
     `);
     
     return stmt.run(
-      validation.sanitized.id,
-      validation.sanitized.name,
-      validation.sanitized.type,
-      validation.sanitized.auctionId,
-      validation.sanitized.createdBy
+      crypto.randomUUID(),
+      validation.sanitized.watchlistId,
+      validation.sanitized.notificationType,
+      validation.sanitized.title,
+      validation.sanitized.message
     );
   }
 
-  getChatRoom(id) {
-    const validation = this.securityLayer.validateInput(id);
+  getWatchlistNotifications(userId, options = {}) {
+    const validation = this.securityLayer.validateInputs({ userId });
     if (!validation.valid) {
-      throw new Error('Invalid room ID');
+      throw new Error(validation.errors.join(', '));
     }
     
-    const stmt = this.securityLayer.prepare('SELECT * FROM chat_rooms WHERE id = ?');
-    return stmt.get(validation.sanitized);
-  }
-
-  getChatRoomsByAuction(auctionId) {
-    const validation = this.securityLayer.validateInput(auctionId);
-    if (!validation.valid) {
-      throw new Error('Invalid auction ID');
+    let query = `
+      SELECT wn.*, w.user_id, w.auction_id, a.title as auction_title
+      FROM watchlist_notifications wn
+      JOIN watchlist w ON wn.watchlist_id = w.id
+      JOIN auctions a ON w.auction_id = a.id
+      WHERE w.user_id = ?
+    `;
+    
+    const params = [validation.sanitized.userId];
+    
+    if (options.unreadOnly) {
+      query += ' AND wn.is_read = 0';
     }
     
-    const stmt = this.securityLayer.prepare('SELECT * FROM chat_rooms WHERE auction_id = ?');
-    return stmt.all(validation.sanitized);
+    if (options.type) {
+      query += ' AND wn.notification_type = ?';
+      params.push(options.type);
+    }
+    
+    query += ' ORDER BY wn.created_at DESC';
+    
+    if (options.limit) {
+      query += ' LIMIT ?';
+      params.push(options.limit);
+    }
+    
+    const stmt = this.securityLayer.prepare(query);
+    return stmt.all(...params);
   }
 
-  getGlobalChatRoom() {
-    const stmt = this.securityLayer.prepare("SELECT * FROM chat_rooms WHERE type = 'global' LIMIT 1");
-    return stmt.get();
+  markNotificationAsRead(notificationId) {
+    const validation = this.securityLayer.validateInput(notificationId);
+    if (!validation.valid) {
+      throw new Error(validation.errors.join(', '));
+    }
+    
+    const stmt = this.securityLayer.prepare(`
+      UPDATE watchlist_notifications 
+      SET is_read = 1 
+      WHERE id = ?
+    `);
+    
+    return stmt.run(validation.sanitized);
   }
 
-  addChatParticipant(participant) {
+  logWatchlistActivity(watchlistId, activityType, details = null) {
     const validation = this.securityLayer.validateInputs({
-      id: participant.id,
-      roomId: participant.roomId,
-      userId: participant.userId,
-      role: participant.role
+      watchlistId,
+      activityType
     });
     
     if (!validation.valid) {
@@ -3306,187 +3737,104 @@ class AuctionDatabase {
     }
     
     const stmt = this.securityLayer.prepare(`
-      INSERT OR IGNORE INTO chat_participants (id, room_id, user_id, role)
+      INSERT INTO watchlist_activity (id, watchlist_id, activity_type, details)
       VALUES (?, ?, ?, ?)
     `);
     
     return stmt.run(
-      validation.sanitized.id,
-      validation.sanitized.roomId,
-      validation.sanitized.userId,
-      validation.sanitized.role
+      crypto.randomUUID(),
+      validation.sanitized.watchlistId,
+      validation.sanitized.activityType,
+      details ? JSON.stringify(details) : null
     );
   }
 
-  getChatParticipants(roomId) {
-    const validation = this.securityLayer.validateInput(roomId);
-    if (!validation.valid) {
-      throw new Error('Invalid room ID');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      SELECT cp.*, u.username, u.email 
-      FROM chat_participants cp
-      JOIN users u ON cp.user_id = u.id
-      WHERE cp.room_id = ?
-    `);
-    
-    return stmt.all(validation.sanitized);
-  }
-
-  updateParticipantOnlineStatus(userId, roomId, isOnline) {
-    const validation = this.securityLayer.validateInputs({ userId, roomId, isOnline });
+  getWatchlistActivity(userId, options = {}) {
+    const validation = this.securityLayer.validateInputs({ userId });
     if (!validation.valid) {
       throw new Error(validation.errors.join(', '));
     }
     
-    const stmt = this.securityLayer.prepare(`
-      UPDATE chat_participants 
-      SET is_online = ?, last_read_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND room_id = ?
-    `);
+    let query = `
+      SELECT wa.*, w.auction_id, a.title as auction_title
+      FROM watchlist_activity wa
+      JOIN watchlist w ON wa.watchlist_id = w.id
+      JOIN auctions a ON w.auction_id = a.id
+      WHERE w.user_id = ?
+    `;
     
-    return stmt.run(
-      validation.sanitized.isOnline ? 1 : 0,
-      validation.sanitized.userId,
-      validation.sanitized.roomId
-    );
-  }
-
-  createChatMessage(message) {
-    const validation = this.securityLayer.validateInputs({
-      id: message.id,
-      roomId: message.roomId,
-      userId: message.userId,
-      content: message.content,
-      messageType: message.messageType,
-      fileUrl: message.fileUrl,
-      fileName: message.fileName,
-      fileSize: message.fileSize,
-      replyToId: message.replyToId
-    });
+    const params = [validation.sanitized.userId];
     
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
+    if (options.activityType) {
+      query += ' AND wa.activity_type = ?';
+      params.push(options.activityType);
     }
     
-    const stmt = this.securityLayer.prepare(`
-      INSERT INTO chat_messages (id, room_id, user_id, content, message_type, file_url, file_name, file_size, reply_to_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    query += ' ORDER BY wa.created_at DESC';
     
-    return stmt.run(
-      validation.sanitized.id,
-      validation.sanitized.roomId,
-      validation.sanitized.userId,
-      validation.sanitized.content,
-      validation.sanitized.messageType || 'text',
-      validation.sanitized.fileUrl,
-      validation.sanitized.fileName,
-      validation.sanitized.fileSize,
-      validation.sanitized.replyToId
-    );
-  }
-
-  getChatMessages(roomId, limit = 50, offset = 0) {
-    const validation = this.securityLayer.validateInputs({ roomId, limit, offset });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
+    if (options.limit) {
+      query += ' LIMIT ?';
+      params.push(options.limit);
     }
     
-    const stmt = this.securityLayer.prepare(`
-      SELECT cm.*, u.username 
-      FROM chat_messages cm
-      JOIN users u ON cm.user_id = u.id
-      WHERE cm.room_id = ?
-      ORDER BY cm.created_at DESC
-      LIMIT ? OFFSET ?
-    `);
+    const stmt = this.securityLayer.prepare(query);
+    const activities = stmt.all(...params);
     
-    return stmt.all(validation.sanitized.roomId, validation.sanitized.limit, validation.sanitized.offset);
+    return activities.map(activity => ({
+      ...activity,
+      details: activity.details ? JSON.parse(activity.details) : null
+    }));
   }
 
-  editMessage(messageId, newContent) {
-    const validation = this.securityLayer.validateInputs({ messageId, newContent });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
-    
+  // Helper methods for notifications
+  async checkWatchlistAlerts() {
+    // Get all active watchlist items with notifications enabled
     const stmt = this.securityLayer.prepare(`
-      UPDATE chat_messages 
-      SET content = ?, is_edited = 1, edited_at = CURRENT_TIMESTAMP
-      WHERE id = ?
+      SELECT w.*, a.title, a.current_highest_bid, a.end_time, a.status
+      FROM watchlist w
+      JOIN auctions a ON w.auction_id = a.id
+      WHERE a.status = 'active'
     `);
     
-    return stmt.run(validation.sanitized.newContent, validation.sanitized.messageId);
-  }
-
-  setTypingIndicator(roomId, userId, isTyping) {
-    const validation = this.securityLayer.validateInputs({ roomId, userId, isTyping });
-    if (!validation.valid) {
-      throw new Error(validation.errors.join(', '));
-    }
+    const watchlistItems = stmt.all();
+    const alerts = [];
     
-    if (isTyping) {
-      const stmt = this.securityLayer.prepare(`
-        INSERT OR REPLACE INTO chat_typing_indicators (id, room_id, user_id, is_typing, started_at, expires_at)
-        VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, datetime('now', '+10 seconds'))
-      `);
+    for (const item of watchlistItems) {
+      const preferences = JSON.parse(item.notification_preferences || '{}');
       
-      return stmt.run(
-        `${roomId}_${userId}_${Date.now()}`,
-        validation.sanitized.roomId,
-        validation.sanitized.userId
-      );
-    } else {
-      const stmt = this.securityLayer.prepare(`
-        DELETE FROM chat_typing_indicators 
-        WHERE room_id = ? AND user_id = ?
-      `);
+      // Check ending soon alerts (within 1 hour)
+      if (preferences.ending_soon) {
+        const endTime = new Date(item.end_time);
+        const now = new Date();
+        const timeDiff = endTime - now;
+        const hoursDiff = timeDiff / (1000 * 60 * 60);
+        
+        if (hoursDiff <= 1 && hoursDiff > 0) {
+          alerts.push({
+            watchlistId: item.id,
+            type: 'ending_soon',
+            title: 'Auction Ending Soon',
+            message: `Auction "${item.title}" is ending in less than 1 hour!`,
+            auctionId: item.auction_id
+          });
+        }
+      }
       
-      return stmt.run(validation.sanitized.roomId, validation.sanitized.userId);
-    }
-  }
-
-  getTypingUsers(roomId) {
-    const validation = this.securityLayer.validateInput(roomId);
-    if (!validation.valid) {
-      throw new Error('Invalid room ID');
-    }
-    
-    const stmt = this.securityLayer.prepare(`
-      SELECT cti.*, u.username 
-      FROM chat_typing_indicators cti
-      JOIN users u ON cti.user_id = u.id
-      WHERE cti.room_id = ? AND cti.expires_at > CURRENT_TIMESTAMP
-    `);
-    
-    return stmt.all(validation.sanitized.roomId);
-  }
-
-  cleanupExpiredTypingIndicators() {
-    const stmt = this.securityLayer.prepare(`
-      DELETE FROM chat_typing_indicators 
-      WHERE expires_at <= CURRENT_TIMESTAMP
-    `);
-    
-    return stmt.run();
-  }
-
-  getOnlineUsers(roomId) {
-    const validation = this.securityLayer.validateInput(roomId);
-    if (!validation.valid) {
-      throw new Error('Invalid room ID');
+      // Check price change alerts
+      if (preferences.price_change && item.price_threshold) {
+        if (item.current_highest_bid >= item.price_threshold) {
+          alerts.push({
+            watchlistId: item.id,
+            type: 'price_change',
+            title: 'Price Alert Triggered',
+            message: `Auction "${item.title}" has reached your price threshold of $${item.price_threshold}`,
+            auctionId: item.auction_id
+          });
+        }
+      }
     }
     
-    const stmt = this.securityLayer.prepare(`
-      SELECT cp.*, u.username 
-      FROM chat_participants cp
-      JOIN users u ON cp.user_id = u.id
-      WHERE cp.room_id = ? AND cp.is_online = 1
-    `);
-    
-    return stmt.all(validation.sanitized.roomId);
+    return alerts;
   }
 }
 
