@@ -43,6 +43,12 @@ document.addEventListener("DOMContentLoaded", () => {
     setupSocketListeners();
     checkOAuthStatus();
     checkOAuthCallback();
+    
+    // Initialize VR integration after main app is ready
+    setTimeout(() => {
+        initializeVRIntegration();
+        addVRControlsToUI();
+    }, 1000);
 });
 
 function initializeApp() {
@@ -1752,333 +1758,189 @@ function startOnboardingWizard() {
     }
 }
 
-// OAuth Functions
-async function checkOAuthStatus() {
-    try {
-        const response = await fetch('/api/auth/status');
-        const data = await response.json();
+// VR Integration Functions
+function initializeVRIntegration() {
+    // Check if VR is available and setup integration
+    if (window.vrIntegration) {
+        console.log('VR integration available');
         
-        // Show/hide OAuth login buttons based on configuration
-        const googleBtn = document.getElementById('googleLoginBtn');
-        const githubBtn = document.getElementById('githubLoginBtn');
+        // Load current auctions into VR
+        if (auctions.length > 0) {
+            window.vrIntegration.loadAuctions(auctions);
+        }
         
-        if (googleBtn) {
-            if (data.configured?.google) {
-                googleBtn.classList.remove('hidden');
+        // Setup VR event listeners
+        setupVREventListeners();
+    }
+}
+
+function setupVREventListeners() {
+    // Listen for VR-specific events
+    document.addEventListener('vr-auction-selected', (event) => {
+        const auctionId = event.detail.auctionId;
+        selectAuction(auctionId);
+    });
+    
+    document.addEventListener('vr-bid-requested', (event) => {
+        const auctionId = event.detail.auctionId;
+        showBidModal(auctionId);
+    });
+}
+
+// Enhanced auction loading with VR support
+function loadAuctions(reset = false) {
+    if (isLoading || (!hasMoreAuctions && !reset)) return;
+    
+    isLoading = true;
+    showLoadingIndicator();
+    
+    if (reset) {
+        currentPage = 1;
+        auctions = [];
+        renderAuctions();
+    }
+    
+    fetch(`/api/auctions?page=${currentPage}&limit=${AUCTIONS_PER_PAGE}`)
+    .then(response => response.json())
+    .then(data => {
+        const { auctions: newAuctions, pagination } = data;
+        
+        if (reset) {
+            auctions = newAuctions;
+        } else {
+            auctions = [...auctions, ...newAuctions];
+        }
+        
+        currentPage = pagination.page;
+        hasMoreAuctions = pagination.hasMore;
+        isLoading = false;
+        hideLoadingIndicator();
+        
+        renderAuctions();
+        
+        // Update VR with new auctions
+        if (window.vrIntegration && reset) {
+            window.vrIntegration.loadAuctions(auctions);
+        }
+        
+        // Update auction counts
+        updateAuctionCounts();
+    })
+    .catch(error => {
+        console.error('Error loading auctions:', error);
+        isLoading = false;
+        hideLoadingIndicator();
+        showNotification('Failed to load auctions', 'error');
+    });
+}
+
+// Enhanced socket listeners with VR updates
+function setupSocketListeners() {
+    // Connection events
+    socket.on("connect", () => {
+        console.log("Connected to server");
+    });
+    
+    socket.on("disconnect", () => {
+        console.log("Disconnected from server");
+        showNotification("Connection lost. Reconnecting...", "warning");
+    });
+    
+    // Auction events
+    socket.on("auctionCreated", (auction) => {
+        console.log("New auction created:", auction);
+        addAuctionToGrid(auction);
+        addNotification(`New auction: ${auction.title}`, "auction", { auctionId: auction.id });
+        
+        // Update VR with new auction
+        if (window.vrIntegration) {
+            window.vrIntegration.onAuctionCreated(auction);
+        }
+    });
+    
+    socket.on("auctionClosed", (auction) => {
+        console.log("Auction closed:", auction);
+        updateAuctionInGrid(auction);
+        
+        if (auction.winner) {
+            addNotification(`Auction "${auction.title}" closed! Winner: ${auction.winner}`, "success", { auctionId: auction.id });
+        } else {
+            addNotification(`Auction "${auction.title}" closed without bids`, "info", { auctionId: auction.id });
+        }
+        
+        // Update VR with closed auction
+        if (window.vrIntegration) {
+            window.vrIntegration.onAuctionClosed(auction);
+        }
+    });
+    
+    socket.on("bidPlaced", (data) => {
+        console.log("New bid placed:", data);
+        updateBidCount(data.auctionId, data.bidCount);
+        addNotification("New bid placed on auction!", "bid", { auctionId: data.auctionId });
+        
+        // Update VR with new bid
+        if (window.vrIntegration) {
+            window.vrIntegration.onBidPlaced(data);
+        }
+    });
+}
+
+// VR UI Controls
+function addVRControlsToUI() {
+    // Add VR button to navigation
+    const navContainer = document.querySelector('.nav-container') || document.querySelector('header');
+    if (navContainer) {
+        const vrButton = document.createElement('button');
+        vrButton.id = 'vr-nav-button';
+        vrButton.innerHTML = '<i class="fas fa-vr-cardboard"></i> VR Mode';
+        vrButton.className = 'px-4 py-2 bg-gradient-to-r from-purple-500 to-indigo-600 text-white rounded-lg hover:from-purple-600 hover:to-indigo-700 transition-all duration-200 shadow-lg';
+        vrButton.onclick = enterVRMode;
+        
+        navContainer.appendChild(vrButton);
+    }
+    
+    // Add VR status to user menu
+    const userMenu = document.querySelector('.user-menu');
+    if (userMenu) {
+        const vrStatusItem = document.createElement('li');
+        vrStatusItem.innerHTML = `
+            <a href="#" onclick="toggleVRPerformance()" class="block px-4 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700">
+                <i class="fas fa-tachometer-alt mr-2"></i>
+                VR Performance: <span id="vr-perf-status">Normal</span>
+            </a>
+        `;
+        userMenu.appendChild(vrStatusItem);
+    }
+}
+
+function enterVRMode() {
+    if (window.vrIntegration) {
+        window.vrIntegration.enterVR().then(success => {
+            if (success) {
+                showNotification('Entering VR mode...', 'success');
             } else {
-                googleBtn.classList.add('hidden');
-            }
-        }
-        
-        if (githubBtn) {
-            if (data.configured?.github) {
-                githubBtn.classList.remove('hidden');
-            } else {
-                githubBtn.classList.add('hidden');
-            }
-        }
-        
-        // Log OAuth status for debugging
-        console.log('OAuth Status:', data);
-    } catch (error) {
-        console.error('Error checking OAuth status:', error);
-    }
-}
-
-function checkOAuthCallback() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token');
-    const username = urlParams.get('username');
-    const auth = urlParams.get('auth');
-    const provider = urlParams.get('provider');
-    const error = urlParams.get('error');
-    const message = urlParams.get('message');
-    
-    if (error) {
-        // Handle OAuth errors
-        const errorMessage = message || 'OAuth authentication failed';
-        showNotification(errorMessage, 'error');
-        
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
-        return;
-    }
-    
-    if (token && username) {
-        // Successful OAuth authentication
-        const user = {
-            id: urlParams.get('id') || username,
-            username: username,
-            token: token,
-            authType: auth || 'oauth',
-            provider: provider
-        };
-        
-        // Store user session
-        localStorage.setItem('currentUser', JSON.stringify(user));
-        currentUser = user;
-        
-        // Update UI
-        hideAuthModal();
-        updateUserDisplay();
-        checkAdminAccess();
-        
-        // Show success message
-        const providerName = provider ? provider.charAt(0).toUpperCase() + provider.slice(1) : 'OAuth';
-        showNotification(`Successfully logged in with ${providerName}!`, 'success');
-        
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
-        
-        // Reload auctions to refresh user-specific data
-        loadAuctions(true);
-    }
-}
-
-// OAuth Account Management
-async function loadOAuthAccounts() {
-    if (!currentUser || !currentUser.token) return;
-    
-    try {
-        const response = await fetch('/api/user/oauth-accounts', {
-            headers: {
-                'Authorization': `Bearer ${currentUser.token}`
+                showNotification('Failed to enter VR mode', 'error');
             }
         });
-        
-        if (response.ok) {
-            const data = await response.json();
-            displayOAuthAccounts(data.oauthAccounts);
-        } else {
-            console.error('Failed to load OAuth accounts');
-        }
-    } catch (error) {
-        console.error('Error loading OAuth accounts:', error);
-    }
-}
-
-function displayOAuthAccounts(oauthAccounts) {
-    const container = document.getElementById('oauthAccountsContainer');
-    if (!container) return;
-    
-    if (!oauthAccounts || oauthAccounts.length === 0) {
-        container.innerHTML = '<p class="text-gray-500">No OAuth accounts linked</p>';
-        return;
-    }
-    
-    const accountsHtml = oauthAccounts.map(account => `
-        <div class="flex items-center justify-between p-3 border rounded-lg">
-            <div class="flex items-center space-x-3">
-                <div class="w-8 h-8 rounded-full bg-gradient-to-r ${getProviderColors(account.provider)} flex items-center justify-center">
-                    <span class="text-white font-bold text-sm">${account.provider.charAt(0).toUpperCase()}</span>
-                </div>
-                <div>
-                    <p class="font-medium">${account.provider.charAt(0).toUpperCase() + account.provider.slice(1)}</p>
-                    <p class="text-sm text-gray-500">Linked ${new Date(account.linkedAt).toLocaleDateString()}</p>
-                </div>
-            </div>
-            <button 
-                onclick="unlinkOAuthAccount('${account.provider}')"
-                class="text-red-600 hover:text-red-800 text-sm font-medium"
-            >
-                Unlink
-            </button>
-        </div>
-    `).join('');
-    
-    container.innerHTML = accountsHtml;
-}
-
-function getProviderColors(provider) {
-    switch (provider) {
-        case 'google': return 'from-blue-500 to-red-500';
-        case 'github': return 'from-gray-700 to-gray-900';
-        default: return 'from-blue-500 to-purple-500';
-    }
-}
-
-async function unlinkOAuthAccount(provider) {
-    if (!currentUser || !currentUser.token) return;
-    
-    if (!confirm(`Are you sure you want to unlink your ${provider} account?`)) {
-        return;
-    }
-    
-    try {
-        const response = await fetch(`/api/user/oauth-accounts/${provider}`, {
-            method: 'DELETE',
-            headers: {
-                'Authorization': `Bearer ${currentUser.token}`
-            }
-        });
-        
-        if (response.ok) {
-            showNotification(`${provider.charAt(0).toUpperCase() + provider.slice(1)} account unlinked successfully`, 'success');
-            loadOAuthAccounts(); // Refresh the list
-        } else {
-            const error = await response.json();
-            showNotification(error.error || 'Failed to unlink account', 'error');
-        }
-    } catch (error) {
-        console.error('Error unlinking OAuth account:', error);
-        showNotification('Failed to unlink account', 'error');
-    }
-}
-
-// Token Management
-async function refreshToken() {
-    if (!currentUser || !currentUser.token) return;
-    
-    try {
-        const response = await fetch('/api/auth/refresh', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${currentUser.token}`
-            }
-        });
-        
-        if (response.ok) {
-            const data = await response.json();
-            
-            // Update stored user with new token
-            currentUser.token = data.token;
-            localStorage.setItem('currentUser', JSON.stringify(currentUser));
-            
-            showNotification('Token refreshed successfully', 'success');
-        } else {
-            const error = await response.json();
-            showNotification(error.error || 'Failed to refresh token', 'error');
-            
-            // If refresh fails, log out the user
-            if (response.status === 401) {
-                logout();
-            }
-        }
-    } catch (error) {
-        console.error('Error refreshing token:', error);
-        showNotification('Failed to refresh token', 'error');
-    }
-}
-
-// User Dropdown Functions
-function toggleUserDropdown() {
-    const dropdown = document.getElementById('userDropdown');
-    if (dropdown) {
-        dropdown.classList.toggle('hidden');
-        
-        // Update dropdown user info
-        if (currentUser) {
-            const usernameEl = document.getElementById('dropdownUsername');
-            const emailEl = document.getElementById('dropdownEmail');
-            
-            if (usernameEl) {
-                usernameEl.textContent = currentUser.username || 'User';
-            }
-            if (emailEl) {
-                emailEl.textContent = currentUser.email || '';
-            }
-        }
-    }
-}
-
-function hideUserDropdown() {
-    const dropdown = document.getElementById('userDropdown');
-    if (dropdown) {
-        dropdown.classList.add('hidden');
-    }
-}
-
-// OAuth Accounts Modal Functions
-function showOAuthAccounts() {
-    const modal = document.getElementById('oauthAccountsModal');
-    if (modal) {
-        modal.classList.remove('hidden');
-        loadOAuthAccounts();
-        updateModalOAuthButtons();
-    }
-    hideUserDropdown();
-}
-
-function hideOAuthAccounts() {
-    const modal = document.getElementById('oauthAccountsModal');
-    if (modal) {
-        modal.classList.add('hidden');
-    }
-}
-
-function updateModalOAuthButtons() {
-    // Check OAuth status and show/hide modal buttons
-    fetch('/api/auth/status')
-        .then(response => response.json())
-        .then(data => {
-            const googleBtn = document.getElementById('modalGoogleLoginBtn');
-            const githubBtn = document.getElementById('modalGithubLoginBtn');
-            
-            if (googleBtn) {
-                if (data.configured?.google) {
-                    googleBtn.classList.remove('hidden');
-                } else {
-                    googleBtn.classList.add('hidden');
-                }
-            }
-            
-            if (githubBtn) {
-                if (data.configured?.github) {
-                    githubBtn.classList.remove('hidden');
-                } else {
-                    githubBtn.classList.add('hidden');
-                }
-            }
-        })
-        .catch(error => {
-            console.error('Error checking OAuth status for modal:', error);
-        });
-}
-
-// Close dropdowns when clicking outside
-document.addEventListener('click', (event) => {
-    const userDropdown = document.getElementById('userDropdown');
-    const userMenuButton = event.target.closest('button[onclick="toggleUserDropdown()"]');
-    
-    if (userDropdown && !userDropdown.contains(event.target) && !userMenuButton) {
-        hideUserDropdown();
-    }
-});
-
-// Close modals when clicking outside
-document.addEventListener('click', (event) => {
-    const oauthModal = document.getElementById('oauthAccountsModal');
-    const authModal = document.getElementById('authModal');
-    
-    if (oauthModal && !oauthModal.contains(event.target) && !event.target.closest('button[onclick="showOAuthAccounts()"]')) {
-        hideOAuthAccounts();
-    }
-});
-
-// Update user display function to include email
-function updateUserDisplay() {
-    const userMenu = document.getElementById('userMenu');
-    const usernameDisplay = document.getElementById('usernameDisplay');
-    const analyticsLink = document.getElementById('analyticsLink');
-    
-    if (currentUser) {
-        if (userMenu) userMenu.classList.remove('hidden');
-        if (usernameDisplay) usernameDisplay.textContent = currentUser.username || currentUser.email || 'User';
-        if (analyticsLink) analyticsLink.classList.remove('hidden');
     } else {
-        if (userMenu) userMenu.classList.add('hidden');
-        if (analyticsLink) analyticsLink.classList.add('hidden');
+        showNotification('VR not available', 'error');
+    }
+}
+
+function toggleVRPerformance() {
+    if (window.vrIntegration) {
+        const isPerformanceMode = window.vrIntegration.togglePerformanceMode();
+        const statusElement = document.getElementById('vr-perf-status');
+        if (statusElement) {
+            statusElement.textContent = isPerformanceMode ? 'Optimized' : 'Normal';
+        }
+        showNotification(`VR performance mode: ${isPerformanceMode ? 'Optimized' : 'Normal'}`, 'info');
     }
 }
 
 // Make functions globally available
 window.startOnboardingWizard = startOnboardingWizard;
-window.checkOAuthStatus = checkOAuthStatus;
-window.checkOAuthCallback = checkOAuthCallback;
-window.loadOAuthAccounts = loadOAuthAccounts;
-window.unlinkOAuthAccount = unlinkOAuthAccount;
-window.refreshToken = refreshToken;
-window.toggleUserDropdown = toggleUserDropdown;
-window.hideUserDropdown = hideUserDropdown;
-window.showOAuthAccounts = showOAuthAccounts;
-window.hideOAuthAccounts = hideOAuthAccounts;
+window.initializeVRIntegration = initializeVRIntegration;
+window.enterVRMode = enterVRMode;
+window.toggleVRPerformance = toggleVRPerformance;
