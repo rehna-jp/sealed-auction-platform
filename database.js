@@ -1203,6 +1203,49 @@ class AuctionDatabase {
     return result.highest;
   }
 
+  getUserBidHistory(userId, options = {}) {
+    const { limit = 20, status = null, sortBy = 'timestamp', sortOrder = 'DESC' } = options;
+    
+    const userValidation = this.securityLayer.validateInput(userId);
+    if (!userValidation.valid) {
+      throw new Error('Invalid user ID');
+    }
+    
+    let query = `
+      SELECT b.*, 
+             a.title as auction_title, 
+             a.status as auction_status, 
+             a.end_time,
+             (SELECT MAX(amount) FROM bids WHERE auction_id = a.id) as current_highest_bid,
+             CASE WHEN a.winner_id = b.bidder_id THEN 1 ELSE 0 END as is_winning_bid
+      FROM bids b
+      JOIN auctions a ON b.auction_id = a.id
+      WHERE b.bidder_id = ?
+    `;
+    
+    const params = [userValidation.sanitized];
+    
+    if (status && status !== 'all') {
+      query += ` AND a.status = ?`;
+      params.push(status);
+    }
+    
+    // Group by auction ID if we just want the highest bid per auction
+    // But since this is a history, we probably want all bids.
+    // Wait, the frontend might want just the latest bid per auction if status='active'.
+    // The previous implementation used it for "Active Bids" and "Recent Activity".
+    
+    const validSortColumns = ['timestamp', 'amount'];
+    const sortColumn = validSortColumns.includes(sortBy) ? sortBy : 'timestamp';
+    const sortDirection = sortOrder.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    
+    query += ` ORDER BY b.${sortColumn} ${sortDirection} LIMIT ?`;
+    params.push(parseInt(limit) || 20);
+    
+    const stmt = this.securityLayer.prepare(query);
+    return stmt.all(...params);
+  }
+
   // Password reset operations
   getUserByEmail(email) {
     const validation = this.securityLayer.validateInput(email);
